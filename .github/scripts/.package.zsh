@@ -259,7 +259,7 @@ ${_usage_host:-}"
       if (( _loglevel > 1 || ${+CI} )) _tarflags="v${_tarflags}"
 
       pushd ${project_root}/release/${config}
-      XZ_OPT=-T0 tar "-${_tarflags}" ${project_root}/release/${output_name}.tar.xz (lib|share)
+      XZ_OPT=-T0 tar "-${_tarflags}" ${project_root}/release/${output_name}.tar.xz bin lib share
       popd
     }
     log_group

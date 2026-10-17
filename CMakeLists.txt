@@ -42,3 +42,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/gnome-capture
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${GSTREAMER_INCLUDE_DIRS} ${JSON_GLIB_INCLUDE_DIRS})
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+add_executable(mutter_inject src/mutter_inject.cpp)
+
+install(
+  TARGETS mutter_inject
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
