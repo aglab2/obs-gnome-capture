@@ -133,6 +133,7 @@ static void update_windows(data_t *data)
 		goto fail;
 	}
 
+	// TODO: FIXME
 	const gchar *command = "global"
 			       ".get_window_actors()"
 			       ".map(a=>a.meta_window)"
