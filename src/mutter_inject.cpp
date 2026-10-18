@@ -19,6 +19,15 @@
 
 #include "elf.h"
 
+// MARK: logging
+#if 1
+#define log(fmt, ...) printf(fmt, ##__VA_ARGS__)
+#else
+#define log() do{}while(0)
+#endif
+
+// MARK: ptrace
+
 static int ptraceAttach(pid_t pid)
 {
 	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
@@ -84,87 +93,213 @@ static void ptrace_write_string(pid_t pid, long *addr, long val)
 	}
 }
 
-static bool hasLibMutter(std::ifstream &file)
+// MARK: procfs parser
+
+struct ProcfsMapEntry
 {
-	std::string line;
-	while (std::getline(file, line)) {
-		// 7fef9a800000-7fef9a83e000 r-xp 00000000 103:04 23623016                  /usr/lib/libmutter-18.so.0.0.0
-		auto dash = line.find('-');
-		if (dash == std::string::npos)
-			continue;
-		auto space = line.find(' ');
-		if (space == std::string::npos)
-			continue;
+    uint64_t start;
+    uint64_t end;
+    uint64_t offset;
+    char perms[4];
+    std::string pathname;
+};
 
-		std::string_view lineSV{line};
-		std::string_view perms = lineSV.substr(space + 1, 4); // rw-p
-		if (perms.length() != 4)
-			continue;
+struct ProcfsMapIter
+{
+public:
+    ProcfsMapIter(pid_t pid, std::string filter);
+    struct ProcfsMapEntry* next();
 
-		if ('x' != perms[2] && 'r' != perms[0])
-			continue;
+    explicit operator bool() const { return file_.is_open(); }
 
-		size_t npos = line.find("libmutter");
-		if (std::string::npos != npos)
-			return true;
-	}
+private:
+    std::ifstream file_;
+    std::string filter_;
+    ProcfsMapEntry entry_;
+    std::string line_;
+};
 
-	return false;
+ProcfsMapIter::ProcfsMapIter(pid_t pid, std::string filter)
+: filter_(std::move(filter))
+{
+    char line[100];
+    sprintf(line, "/proc/%d/maps", pid);
+
+    file_.open(line, std::ios::in | std::ios::binary);
+    if (!file_.is_open())
+        return;
 }
 
-static bool detectLibc(std::ifstream &file)
+static inline const char* sstrchr(const std::string& line, char sym)
 {
-	std::string line;
-	while (std::getline(file, line)) {
-		// 7fef9a800000-7fef9a83e000 r-xp 00000000 103:04 23623016                  /usr/lib/libmutter-18.so.0.0.0
-		auto dash = line.find('-');
-		if (dash == std::string::npos)
-			continue;
-		auto space = line.find(' ');
-		if (space == std::string::npos)
-			continue;
-
-		std::string_view lineSV{line};
-		std::string_view perms = lineSV.substr(space + 1, 4); // rw-p
-		if (perms.length() != 4)
-			continue;
-
-		if ('x' != perms[2] && 'r' != perms[0])
-			continue;
-
-		size_t npos = line.find("libc.so.6");
-		if (std::string::npos != npos)
-			return true;
-	}
-
-	return false;
+    auto loc = line.find(sym);
+    if (loc == std::string::npos)
+    {
+        return NULL;
+    }
+    else
+    {
+        return line.data() + loc;
+    }
 }
 
-
-struct LibcFunctions find_libc(int pid)
+struct ProcfsMapEntry* ProcfsMapIter::next()
 {
-    struct LibcFunctions ret = {0};
+    while (std::getline(file_, line_))
+    {
+        if (std::string::npos == line_.find(filter_))
+            continue;
 
-    char libcPath[256];
+        const char* dash = sstrchr(line_, '-');
+        if (!dash)
+            continue;
+        const char* space = sstrchr(line_, ' ');
+        if (!space)
+            continue;
+
+        const char* perms = space + 1;
+        const char* offsetStart = perms + 5;
+        const char* offsetEnd = strchr(offsetStart, ' ');
+        if (!offsetEnd)
+            continue;
+
+        char tmp[32] = {0};
+
+        strncpy(tmp, line_.data(), dash - line_.data());
+        tmp[dash - line_.data()] = '\0';
+        entry_.start = strtoull(tmp, NULL, 16);
+
+        strncpy(tmp, dash + 1, space - dash - 1);
+        tmp[space - dash - 1] = '\0';
+        entry_.end = strtoull(tmp, NULL, 16);
+
+        strncpy(tmp, offsetStart, offsetEnd - offsetStart);
+        tmp[offsetEnd - offsetStart] = '\0';
+        uint32_t offset = strtoul(tmp, NULL, 16);
+        entry_.offset = offset;
+
+        memcpy(entry_.perms, perms, 4);
+
+        entry_.pathname = strchr(offsetEnd, '/');
+
+        return &entry_;
+    }
+
+    return NULL;
+}
+
+// MARK: unix file
+
+struct UnixFile
+{
+    UnixFile() : UnixFile(-1) {}
+    UnixFile(int fd);
+    ~UnixFile();
+
+    UnixFile& operator=(const UnixFile&) = delete;
+    UnixFile(const UnixFile&) = delete;
+
+    UnixFile& operator=(UnixFile&&);
+    UnixFile(UnixFile&&);
+
+    bool pread(size_t sz, off_t off, void* buf);
+    explicit operator bool() { return fd_ != -1; }
+
+private:
+    int fd_;
+};
+
+UnixFile::UnixFile(int fd) : fd_(fd)
+{}
+
+UnixFile::~UnixFile()
+{
+    if (fd_ != -1) close(fd_);
+}
+
+UnixFile& UnixFile::operator=(UnixFile&& o)
+{
+    if (fd_ != -1) close(fd_);
+    fd_ = o.fd_;
+    o.fd_ = -1;
+    return *this;
+}
+
+UnixFile::UnixFile(UnixFile&& o) : fd_(o.fd_)
+{
+    o.fd_ = -1;
+}
+
+bool UnixFile::pread(size_t sz, off_t off, void* buf)
+{
+    return sz == ::pread(fd_, buf, sz, off);
+}
+
+// MARK: recon
+
+struct Section
+{
+    uint64_t start;
+    uint64_t end;
+    uint64_t offset;
+    std::vector<uint8_t> data;
+};
+
+static struct Section* sectionsFind(std::vector<Section>& sections, uint64_t offset, uint64_t size)
+{
+    uint64_t end = offset + size;
+    for (auto& s : sections)
+    {
+        uint64_t section_start = s.offset;
+        uint64_t section_end   = s.offset + (s.end - s.start);
+        if (section_start <= offset && end <= section_end)
+        {
+            return &s;
+        }
+    }
+
+    return NULL;
+}
+
+static const char* safeStr(const std::vector<char>& buf, size_t offset, size_t limit)
+{
+    if (offset >= buf.size())
+        return NULL;
+
+    if (limit > buf.size())
+    {
+        for (size_t i = offset; i < buf.size(); i++)
+        {
+            if (buf[i] == '\0')
+                return buf.data() + offset;
+        }
+
+        return NULL;
+    }
+
+    return buf.data() + offset;
+}
+
+uint64_t findSyscallInLibc(int pid)
+{
+    std::string libcPath;
     uint64_t elfloc = 0;
 
-    struct Section xloc;
-    struct Sections sections;
+    Section xloc;
+    std::vector<Section> sections;
+    uint64_t ret = 0;
 
     // Discover the location of libc.so.6 in the target process's memory space
     {
-        struct ProcfsMapIter* iter = procfs_map_iter_new(pid, "libc.so.6");
+        ProcfsMapIter iter{ pid, "libc.so.6" };
         if (!iter)
         {
             return ret;
         }
 
-        sections_init(&sections);
-
-        struct ProcfsMapEntry* entry;
-        while ((entry = procfs_map_iter_next(iter)))
+        while (struct ProcfsMapEntry* entry = iter.next())
         {
-            if (!entry->pathname)
+            if (!entry->pathname.size())
             {
                 log("Found libc: %llx %llx-%llx %.4s (no pathname?)\n", entry->offset, entry->start, entry->end, entry->perms);
                 continue;
@@ -174,8 +309,7 @@ struct LibcFunctions find_libc(int pid)
             if (0 == entry->offset)
             {
                 elfloc = entry->start;
-                strncpy(libcPath, entry->pathname, sizeof(libcPath) - 1);
-                libcPath[255] = '\0';
+                libcPath = entry->pathname;
             }
 
             if (entry->perms[2] == 'x')
@@ -188,72 +322,72 @@ struct LibcFunctions find_libc(int pid)
              && entry->perms[1] != 'w'
              && entry->perms[2] != 'x')
             {
-                sections_add(&sections, entry->start, entry->end, entry->offset);
+                sections.push_back({ entry->start, entry->end, entry->offset });
             }
         }
-
-        procfs_map_iter_free(iter);
     }
 
     if (!elfloc || !xloc.start || !xloc.end)
     {
         log("Failed to find libc.so.6 in process %d\n", pid);
-        sections_free(&sections);
         return ret;
     }
 
-    FILE* ram = NULL;
-    Elf64_Shdr* shdrs = NULL;
+    UnixFile ram;
+    std::vector<Elf64_Shdr> shdrs;
+
     Elf64_Sym* sym_table = NULL;
-    char* str_table = NULL;
+    struct AutoFree{
+        AutoFree(Elf64_Sym*& ptr) : ptr(ptr) {}
+        ~AutoFree(){ if (ptr) free(ptr); }
+
+        Elf64_Sym*& ptr;
+    } _af{ sym_table };
+
+    std::vector<char> str_table;
 
     // Analyze and prove that we have libc decently mapped by reading the ELF header and section headers
     {
         char path[64] = {0};
         snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-        ram = fopen(path, "rb");
+        ram = open(path, O_RDONLY);
         if (!ram)
         {
             log("Failed to open /proc/%d/mem\n", pid);
-            goto fini;
+            return ret;
         }
     }
 
     // Start reading ELF
     Elf64_Ehdr ehdr;
     {
-        fseeko64(ram, elfloc, SEEK_SET);
-        if (1 != fread(&ehdr, sizeof(ehdr), 1, ram))
+        if (!ram.pread(sizeof(ehdr), elfloc, &ehdr))
         {
             log("Failed to read ELF header from libc.so.6 in process %d\n", pid);
-            goto fini;
+            return ret;
         }
 
         if (ehdr.e_ident[0] != 0x7f || ehdr.e_ident[1] != 'E' || ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F')
         {
             log("Failed to read ELF header from libc.so.6 in process %d\n", pid);
-            goto fini;
+            return ret;
         }
     }
 
     // shdrs are not actually mapped in memory so we have to open the file and read them from disk
-    shdrs = malloc(sizeof(Elf64_Shdr) * ehdr.e_shnum);
+    shdrs.resize(ehdr.e_shnum);
     {
-        FILE* libc = fopen(libcPath, "rb");
+        UnixFile libc = open(libcPath.c_str(), O_RDONLY);
         if (!libc)
         {
             log("Failed to open libc.so.6 at '%s'\n", libcPath);
-            goto fini;
+            return ret;
         }
 
-        fseeko64(libc, ehdr.e_shoff, SEEK_SET);
-        size_t amt = fread(shdrs, sizeof(Elf64_Shdr), ehdr.e_shnum, libc);
-        fclose(libc);
-
-        if (amt != ehdr.e_shnum)
+        if (!libc.pread(ehdr.e_shnum * sizeof(Elf64_Shdr), ehdr.e_shoff, shdrs.data()))
         {
             log("Failed to read section headers from libc.so.6\n");
-            goto fini;
+            return ret;
         }
     }
 
@@ -278,123 +412,69 @@ struct LibcFunctions find_libc(int pid)
     if (!dynsym || !strtab)
     {
         log("Failed to find dynsym or strtab in libc.so.6\n");
-        goto fini;
+        return ret;
     }
 
     // Load in from RAM the dynsym and strtab sections so we can iterate over them and find the symbols we want
-    struct Section* dynsymSec = sections_find(&sections, dynsym->sh_offset, dynsym->sh_size);
-    struct Section* strtabSec = sections_find(&sections, strtab->sh_offset, strtab->sh_size);
+    struct Section* dynsymSec = sectionsFind(sections, dynsym->sh_offset, dynsym->sh_size);
+    struct Section* strtabSec = sectionsFind(sections, strtab->sh_offset, strtab->sh_size);
     if (!dynsymSec || !strtabSec)
     {
         log("Failed to find dynsym or strtab in mapped sections\n");
-        goto fini;
+        return ret;
     }
 
-    sym_table = malloc(dynsym->sh_size);
-    fseeko64(ram, dynsymSec->start + (dynsym->sh_offset - dynsymSec->offset), SEEK_SET);
-    if (1 != fread(sym_table, dynsym->sh_size, 1, ram))
+    sym_table = (Elf64_Sym*) malloc(dynsym->sh_size);
+    if (!ram.pread(dynsym->sh_size, dynsymSec->start + (dynsym->sh_offset - dynsymSec->offset), sym_table))
     {
         log("Failed to read dynsym from process %d\n", pid);
-        goto fini;
+        return ret;
     }
 
-    str_table = malloc(strtab->sh_size);
-    fseeko64(ram, strtabSec->start + (strtab->sh_offset - strtabSec->offset), SEEK_SET);
-    if (1 != fread((void*)str_table, strtab->sh_size, 1, ram))
+    str_table.resize(strtab->sh_size);
+    if (!ram.pread(strtab->sh_size, strtabSec->start + (strtab->sh_offset - strtabSec->offset), str_table.data()))
     {
         log("Failed to read strtab from process %d\n", pid);
-        goto fini;
+        return ret;
     }
 
-    int total_symbols = dynsym->sh_size / sizeof(Elf64_Sym);
+    long unsigned total_symbols = dynsym->sh_size / sizeof(Elf64_Sym);
     for (int i = 0; i < total_symbols; i++) {
         if (sym_table[i].st_name == 0)
             continue;
 
-        const char *sym_name = safe_str(str_table, strtab->sh_size, sym_table[i].st_name, 16);
+        const char *sym_name = safeStr(str_table, sym_table[i].st_name, 16);
         if (!sym_name)
             continue;
 
-        if (strcmp(sym_name, "__errno_location") == 0)
+        if (strcmp(sym_name, "syscall") == 0)
         {
-            ret.errno_location = xloc.start + sym_table[i].st_value - xloc.offset;
-            if (ret.errno_location > xloc.end)
-            {
-                log("Found __errno_location outside of libc.so.6 mapping\n");
-                ret.errno_location = 0;
-            }
-        }
-        else if (strcmp(sym_name, "syscall") == 0)
-        {
-            ret.syscall = xloc.start + sym_table[i].st_value - xloc.offset;
-            if (ret.syscall > xloc.end)
+            ret = xloc.start + sym_table[i].st_value - xloc.offset;
+            if (ret > xloc.end)
             {
                 log("Found syscall outside of libc.so.6 mapping\n");
-                ret.syscall = 0;
+                ret = 0;
             }
         }
     }
 
-    // verify that libc errno is actually usable. must be
-    /*
-    0:  f3 0f 1e fa                   <prolog stuff>
-    4:  48 8b 05 05 b2 1e 00          mov    rax,QWORD PTR [rip+OFFSET]
-    b:  64 48 03 04 25 00 00 00 00    add    rax,QWORD PTR fs:0x0
-    14: c3                            <epilog stuff>
-    */
+    if (!ret)
+        return 0;
+
     {
         uint8_t code[64];
-        fseeko64(ram, ret.errno_location, SEEK_SET);
-        if (1 != fread(code, sizeof(code), 1, ram))
-        {
-            log("Failed to read __errno_location code from process %d\n", pid);
-            goto fini;
-        }
+        ram.pread(sizeof(code), ret, code);
 
-        static const uint8_t offLoad[] = { 0x48, 0x8b, 0x05 };
-        static const uint8_t fsLoad [] = { 0x64, 0x48, 0x03, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00 };
+        // search for 'syscall'
+        const uint8_t sc[] = { 0x0f, 0x05 };
 
-        uint8_t* offAt = memmem(code, sizeof(code), offLoad, sizeof(offLoad));
-        uint8_t* fsAt  = memmem(code, sizeof(code), fsLoad,  sizeof(fsLoad));
-        if (!offAt && !fsAt)
-        {
-            log("Failed to find __errno_location code pattern in process %d\n", pid);
-            log_buff("errno_location_code", code, sizeof(code));
-            goto fini;
-        }
-
-        uint64_t errno_loc = *(uint32_t*)(offAt + 3)
-                           + (offAt - code)
-                           + 7
-                           + ret.errno_location;
-
-        log("Found __errno_location fs offset: 0x%llx\n", errno_loc);
-        int64_t offset;
-        fseeko64(ram, errno_loc, SEEK_SET);
-        if (1 != fread(&offset, sizeof(offset), 1, ram))
-        {
-            log("Failed to read __errno_location fs offset from process %d\n", pid);
-            goto fini;
-        }
-
-        log("Found __errno_location fs offset value: 0x%llx\n", offset);
-        if (ERRNO_OFFSET_MIN < offset && offset < ERRNO_OFFSET_MAX)
-        {
-            ret.errno_fs_offset = (int)offset;
-        }
-        else
-        {
-            log("Found __errno_location fs offset value is out of range: 0x%llx\n", offset);
-            goto fini;
-        }
+        uint8_t* at = memmem(code, sizeof(code), sc, sizeof(sc));
+        if (!at)
+            return 0;
+        
+        ret += at - code;
     }
 
-fini:
-    if (str_table) free(str_table);
-    if (sym_table) free(sym_table);
-    if (shdrs) free(shdrs);
-    if (ram) fclose(ram);
-    sections_free(&sections);
     return ret;
 }
 
@@ -412,14 +492,9 @@ static std::vector<pid_t> searchProcess()
 		if (!pid)
 			continue;
 
-		char mapPath[100];
-		sprintf(mapPath, "/proc/%d/maps", pid);
-
-		std::ifstream file(mapPath);
-		if (hasLibMutter(file))
-		{
-			result.push_back(pid);
-		}
+        ProcfsMapIter iter{pid, "libmutter"};
+        if (iter.next())
+            result.push_back(pid);
 	}
 	closedir(dir);
 
