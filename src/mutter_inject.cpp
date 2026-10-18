@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 #include <fstream>
 #include <string_view>
@@ -175,8 +176,7 @@ struct ProcfsMapEntry* ProcfsMapIter::next()
 
         strncpy(tmp, offsetStart, offsetEnd - offsetStart);
         tmp[offsetEnd - offsetStart] = '\0';
-        uint32_t offset = strtoul(tmp, NULL, 16);
-        entry_.offset = offset;
+        entry_.offset = strtoull(tmp, NULL, 16);
 
         memcpy(entry_.perms, perms, 4);
 
@@ -232,7 +232,8 @@ UnixFile::UnixFile(UnixFile&& o) : fd_(o.fd_)
 
 bool UnixFile::pread(size_t sz, off_t off, void* buf)
 {
-    return sz == ::pread(fd_, buf, sz, off);
+    ssize_t ret = ::pread(fd_, buf, sz, off);
+    return ret == (ssize_t)sz;
 }
 
 // MARK: recon
@@ -285,7 +286,7 @@ uint64_t findSyscallInLibc(int pid)
     std::string libcPath;
     uint64_t elfloc = 0;
 
-    Section xloc;
+    Section xloc{};
     std::vector<Section> sections;
     uint64_t ret = 0;
 
@@ -301,11 +302,11 @@ uint64_t findSyscallInLibc(int pid)
         {
             if (!entry->pathname.size())
             {
-                log("Found libc: %llx %llx-%llx %.4s (no pathname?)\n", entry->offset, entry->start, entry->end, entry->perms);
+                log("Found libc: %" PRIx64 " %" PRIx64 "-%" PRIx64 " %.4s (no pathname?)\n", entry->offset, entry->start, entry->end, entry->perms);
                 continue;
             }
 
-            log("Found libc: %llx %llx-%llx %.4s\n", entry->offset, entry->start, entry->end, entry->perms);
+            log("Found libc: %" PRIx64 " %" PRIx64 "-%" PRIx64 " %.4s\n", entry->offset, entry->start, entry->end, entry->perms);
             if (0 == entry->offset)
             {
                 elfloc = entry->start;
@@ -338,7 +339,7 @@ uint64_t findSyscallInLibc(int pid)
 
     Elf64_Sym* sym_table = NULL;
     struct AutoFree{
-        AutoFree(Elf64_Sym*& ptr) : ptr(ptr) {}
+        AutoFree(Elf64_Sym*& p) : ptr(p) {}
         ~AutoFree(){ if (ptr) free(ptr); }
 
         Elf64_Sym*& ptr;
@@ -380,7 +381,7 @@ uint64_t findSyscallInLibc(int pid)
         UnixFile libc = open(libcPath.c_str(), O_RDONLY);
         if (!libc)
         {
-            log("Failed to open libc.so.6 at '%s'\n", libcPath);
+            log("Failed to open libc.so.6 at '%s'\n", libcPath.c_str());
             return ret;
         }
 
@@ -438,8 +439,8 @@ uint64_t findSyscallInLibc(int pid)
         return ret;
     }
 
-    long unsigned total_symbols = dynsym->sh_size / sizeof(Elf64_Sym);
-    for (int i = 0; i < total_symbols; i++) {
+    size_t total_symbols = dynsym->sh_size / sizeof(Elf64_Sym);
+    for (size_t i = 0; i < total_symbols; i++) {
         if (sym_table[i].st_name == 0)
             continue;
 
@@ -468,7 +469,7 @@ uint64_t findSyscallInLibc(int pid)
         // search for 'syscall'
         const uint8_t sc[] = { 0x0f, 0x05 };
 
-        uint8_t* at = memmem(code, sizeof(code), sc, sizeof(sc));
+        uint8_t* at = (uint8_t*)memmem(code, sizeof(code), sc, sizeof(sc));
         if (!at)
             return 0;
         
