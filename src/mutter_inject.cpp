@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -53,6 +54,62 @@ static int ptraceAttach(pid_t pid)
 static void ptraceDetach(pid_t pid)
 {
 	ptrace(PTRACE_DETACH, pid, NULL, NULL);
+}
+
+// MARK: alloc memory via ptrace
+
+static void* ptraceAllocateMemory(pid_t pid, uint64_t syscallAddr, size_t size)
+{
+	struct user_regs_struct orig, work;
+	if (ptrace(PTRACE_GETREGS, pid, NULL, &orig) < 0)
+		return NULL;
+
+	memcpy(&work, &orig, sizeof(work));
+	work.rax  = __NR_mmap;
+	work.rdi  = (uint64_t)NULL;
+	work.rsi  = size;
+	work.rdx  = PROT_READ | PROT_EXEC;
+	work.r10  = MAP_PRIVATE | MAP_ANONYMOUS;
+	work.r8   = -1;
+	work.r9   = 0;
+
+	work.rip = syscallAddr;
+
+	if (ptrace(PTRACE_SETREGS, pid, NULL, &work) < 0)
+		return NULL;
+
+	if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) < 0)
+		return NULL;
+
+	int status;
+	if (waitpid(pid, &status, 0) == -1)
+		return NULL;
+
+	if (ptrace(PTRACE_GETREGS, pid, NULL, &work) < 0)
+		return NULL;
+
+	uint64_t result = work.rax;
+
+	work.rip = orig.rip;
+	work.rax = orig.rax;
+	work.rdi = orig.rdi;
+	work.rsi = orig.rsi;
+	work.rdx = orig.rdx;
+	work.r10 = orig.r10;
+	work.r9  = orig.r9;
+	work.r8  = orig.r8;
+
+	if (ptrace(PTRACE_SETREGS, pid, NULL, &work) < 0)
+		return NULL;
+
+	// Check for error: mmap returns >= -4096 on failure
+	if (result >= (uint64_t)(long)(-4095)) {
+		log("  mmap returned error: %p %ld\n", (void*)result, (long) result);
+		return NULL;
+	}
+
+	log("  Allocated: %p (size = %zu bytes)\n", (void*)result, size);
+	return (void*)result;
 }
 
 #if 0
@@ -511,6 +568,18 @@ int main()
 		printf("%d\n", pid);
 		if (ptraceAttach(pid) < 0)
 			continue;
+
+        // Find syscall instruction in libc
+        uint64_t syscallAddr = findSyscallInLibc(pid);
+        if (!syscallAddr) {
+            log("  Failed to find syscall in libc\n");
+            ptraceDetach(pid);
+            continue;
+        }
+        printf("  Syscall instruction at: %p\n", (void*)syscallAddr);
+
+        void* result = ptraceAllocateMemory(pid, syscallAddr, 4096);
+        printf("   %p created\n", result);
 
 		ptraceDetach(pid);
 	}
