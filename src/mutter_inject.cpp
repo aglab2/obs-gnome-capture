@@ -970,19 +970,66 @@ int main()
             log("   Failed to write to rx page\n");
         }
 
+        // 0x100
+        uint8_t content[128] = {
+            0x55,                      // push rbp
+            0x48, 0x89, 0xe5,          // mov rbp, rsp
+            0x48, 0x8b, 0x0d, 0,0,0,0, // mov rcx, off[rip] <- rwPage at 0xf0c
+            0x48, 0x8b, 0x01,          // mov rax, [rcx]
+            0x48, 0x85, 0xc0,          // test rax, rax
+            0x0f, 0x85, 0,0,0,0,       // jne offset
+
+            0x57,                      // push rdi
+            0x56,                      // push rsi
+            0x48, 0x8d, 0x3d, 0,0,0,0, // lea rdi, [rip+off] <- filename at 0xe00
+            0x48, 0xc7, 0xc6, 1,0,0,0, // mov rsi,1
+            0xff, 0x15, 0,0,0,0,       // call off[rip]      <- dlopen at 0xf04
+            0x48, 0x89, 0xc7,          // mov rdi,rax
+            0x48, 0x8d, 0x35, 0,0,0,0, // lea rsi, [rip+off] <- symname at 0xd00
+            0xff, 0x15, 0,0,0,0,       // call off[rip]      <- dlsym at 0xf08
+            0x48, 0x8b, 0x0d, 0,0,0,0, // mov rcx, off[rip]  <- rwPage at 0xf0c
+            0x48, 0x8b, 0x01,          // mov [rcx], rax
+            0x5e,                      // pop rsi
+            0x5f,                      // pop rdi
+
+            // rax jne here
+            0x48, 0x8d, 0x15, 0,0,0,0, // lea rdx, off[rip]  <- orig fn trampoline
+            0xff, 0xd0,                // call rax
+            0x5d,                      // pop rbp
+            0xc3,                      // ret
+        };
+
+        if (!ptraceWriteBytes(pid, rxPage + 0x100, content, sizeof(content), 1 /*rx*/))
+        {
+            log("   Failed to write to rx page\n");
+        }
+
         uint64_t supplPointers[4];
         supplPointers[0] = listWindowAddr + decResult.shift + decResult.count;
         supplPointers[1] = libcRecon.dlopen;
         supplPointers[2] = libcRecon.dlsym;
+        supplPointers[3] = rwPage;
         if (!ptraceWriteBytes(pid, rxPage + 0xf00, (const uint8_t*) supplPointers, sizeof(supplPointers), 1 /*rx*/))
         {
             log("   Failed to write to rx page supplementary pointers\n");
         }
 
+        static const char dlpath[40] = "/usr/local/bin/libmutter_inject.so";
+        if (!ptraceWriteBytes(pid, rxPage + 0xe00, (const uint8_t*) dlpath, sizeof(dlpath), 1 /*rx*/))
+        {
+            log("   Failed to write to rx page dlpath\n");
+        }
+
+        static const char dlsymName[40] = "meta_display_list_window_detour";
+        if (!ptraceWriteBytes(pid, rxPage + 0xd00, (const uint8_t*) dlpath, sizeof(dlpath), 1 /*rx*/))
+        {
+            log("   Failed to write to rx page dlsymName\n");
+        }
+
         // write detour to rx page
         ptraced.moveThreadsOutOfRedzone(listWindowAddr + decResult.shift, listWindowAddr + decResult.shift + decResult.count);
         CodePiece mutterCodeWithHook = decResult.code;
-        writeJmpViaRAX(mutterCodeWithHook.data() + decResult.shift, rxPage + decResult.shift);
+        writeJmpViaRAX(mutterCodeWithHook.data() + decResult.shift, rxPage + 0x100);
         if (!ptraceWriteBytes(pid, listWindowAddr, mutterCodeWithHook.data(), mutterCodeWithHook.size(), 1 /*rx*/))
         {
             log("   Failed to write detour\n");
