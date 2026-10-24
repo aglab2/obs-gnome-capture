@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 
+#include <array>
 #include <fstream>
 #include <string_view>
 #include <vector>
@@ -111,26 +112,64 @@ public:
 		processCont(pid_);
 	}
 
-	explicit operator bool() { return 0 != pid_; } 
+	explicit operator bool() { return 0 != pid_; }
+
+    void moveThreadsOutOfRedzone(uint64_t start, uint64_t end);
 
 private:
 	pid_t pid_;
 	std::vector<pid_t> threads_;
 };
 
+void Ptraced::moveThreadsOutOfRedzone(uint64_t start, uint64_t end)
+{
+    for (auto pid : threads_)
+    {
+        while (1)
+        {
+            struct user_regs_struct orig;
+            if (ptrace(PTRACE_GETREGS, pid, NULL, &orig) < 0)
+                break;
+            
+            if (start <= orig.rip && orig.rip <= end)
+            {
+                log("Advancing thread %d to get out of red zone\n", pid);
+                if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) < 0)
+                    break;
+
+                int status;
+                if (waitpid(pid, &status, 0) == -1)
+                    break;
+
+                // continue checking -> to while(1)
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+}
+
 // MARK: alloc memory via ptrace
 
-static void* ptraceAllocateMemory(pid_t pid, uint64_t syscallAddr, size_t size)
+enum MemoryType
+{
+    MT_RW,
+    MT_RX,
+};
+
+static uint64_t ptraceAllocateMemory(pid_t pid, uint64_t syscallAddr, size_t size, MemoryType mt)
 {
 	struct user_regs_struct orig, work;
 	if (ptrace(PTRACE_GETREGS, pid, NULL, &orig) < 0)
-		return NULL;
+		return 0;
 
 	memcpy(&work, &orig, sizeof(work));
 	work.rax  = __NR_mmap;
 	work.rdi  = (uint64_t)NULL;
 	work.rsi  = size;
-	work.rdx  = PROT_READ | PROT_EXEC;
+	work.rdx  = mt == MT_RW ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);
 	work.r10  = MAP_PRIVATE | MAP_ANONYMOUS;
 	work.r8   = -1;
 	work.r9   = 0;
@@ -138,17 +177,17 @@ static void* ptraceAllocateMemory(pid_t pid, uint64_t syscallAddr, size_t size)
 	work.rip = syscallAddr;
 
 	if (ptrace(PTRACE_SETREGS, pid, NULL, &work) < 0)
-		return NULL;
+		return 0;
 
 	if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) < 0)
-		return NULL;
+		return 0;
 
 	int status;
 	if (waitpid(pid, &status, 0) == -1)
-		return NULL;
+		return 0;
 
 	if (ptrace(PTRACE_GETREGS, pid, NULL, &work) < 0)
-		return NULL;
+		return 0;
 
 	uint64_t result = work.rax;
 
@@ -162,16 +201,16 @@ static void* ptraceAllocateMemory(pid_t pid, uint64_t syscallAddr, size_t size)
 	work.r8  = orig.r8;
 
 	if (ptrace(PTRACE_SETREGS, pid, NULL, &work) < 0)
-		return NULL;
+		return 0;
 
 	// Check for error: mmap returns >= -4096 on failure
 	if (result >= (uint64_t)(long)(-4095)) {
 		log("  mmap returned error: %p %ld\n", (void*)result, (long) result);
-		return NULL;
+		return 0;
 	}
 
 	log("  Allocated: %p (size = %zu bytes)\n", (void*)result, size);
-	return (void*)result;
+	return result;
 }
 
 #if 0
@@ -205,29 +244,19 @@ static char *ptrace_read_string(pid_t pid, void *addr)
 }
 #endif
 
-static void ptrace_write_string(pid_t pid, long *addr, long val)
+static bool ptraceWriteBytes(pid_t pid, uint64_t dest, const uint8_t *src, size_t len, bool rx)
 {
-	if (ptrace(PTRACE_POKETEXT, pid, (void *)addr, (void *)&val) < 0) {
-		perror("ptrace_write_string: POKETEXT failed");
-		return;
-	}
-}
+    if (len % sizeof(long) != 0)
+    {
+        log("Size %zd must be aligned!\n", len);
+        return false;
+    }
 
-// Write a block of bytes to the target process via ptrace POKETEXT
-static bool ptrace_write_bytes(pid_t pid, void *dest, const uint8_t *src, size_t len)
-{
 	size_t offset = 0;
 	while (offset < len) {
-		long val = 0;
-		size_t copy = sizeof(val);
-		if (offset + copy > len)
-			copy = len - offset;
-
-		memset(&val, 0, sizeof(val));
-		memcpy(&val, src + offset, copy);
-
-		if (ptrace(PTRACE_POKETEXT, pid, (void *)((char *)dest + offset), (void *)&val) < 0) {
-			perror("ptrace_write_bytes: POKETEXT failed");
+		size_t copy = sizeof(long);
+		if (ptrace(rx ? PTRACE_POKETEXT : PTRACE_POKEDATA, pid, (char *)dest + offset, *(long*)(src + offset)) < 0) {
+			log("ptrace_write_bytes: POKETEXT failed\n");
 			return false;
 		}
 		offset += copy;
@@ -594,6 +623,205 @@ static uint64_t findFunction(int pid, UnixFile& ram, const char* library, const 
     return ret;
 }
 
+enum Instruction
+{
+    I_UNKNOWN,
+    I_MOV,
+    I_LEA,
+    I_SUB,
+};
+
+using CodePiece = std::array<uint8_t, 64>;
+
+struct DecompileResult
+{
+    int shift;
+    int count;
+    CodePiece code;
+};
+
+// MARK: Decompiling
+static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
+{
+    struct DecompileResult result;
+    result.count = -1;
+
+    if (amount > 64)
+        return result;
+
+    uint8_t *code = result.code.data();
+    if (!ram.pread(result.code.size(), fn, code))
+        return result;
+
+    const uint8_t* p = (const uint8_t*) code;
+    const uint8_t* end = p + result.code.size();
+
+    if (code[0] == 0xf3 && code[1] == 0x0f && code[2] == 0x1e && code[3] == 0xfa)
+    {
+        result.shift = 4;
+        p += 4;
+    }
+    else
+    {
+        result.shift = 0;
+    }
+
+#define consume(n) do { p += n; amount -= n; } while(0)
+
+    while (p < end && amount >= 0)
+    {
+        log("left %d\n", amount);
+
+        uint8_t maybeRex = *p;
+        if (maybeRex >= 0x40 && maybeRex <= 0x4F)
+        {
+            log("Rex: %02x\n", maybeRex);
+            consume(1);
+        }
+
+        bool want_modrm = false;
+        bool want_imm8 = false;
+
+        enum Instruction instruction = I_UNKNOWN;
+
+        uint8_t opcode = *p;
+        consume(1);
+        if (0x0f == opcode)
+        {
+            log("0f\n");
+            opcode = *p;
+            consume(1);
+            if (0xba == opcode)
+            {
+                log("btr\n");
+                want_modrm = true;
+                want_imm8 = true;
+            }
+            else
+            {
+                log("unknown opcode: 0f %02x???\n", opcode);
+                return result;
+            }
+        }
+        else if (0x50 <= opcode && opcode <= 0x57)
+        {
+            log("push r%d\n", opcode - 0x50);
+        }
+        else if (0x58 <= opcode && opcode <= 0x5F)
+        {
+            log("pop r%d\n", opcode - 0x58);
+        }
+        else if (0x72 == opcode)
+        {
+            log("jb\n");
+            want_imm8 = true;
+        }
+        else if (0x87 == opcode)
+        {
+            log("xchg\n");
+            want_modrm = true;
+        }
+        else if (0x89 == opcode)
+        {
+            log("mov\n");
+            instruction = I_MOV;
+            want_modrm = true;
+        }
+        else if (0x8b == opcode)
+        {
+            log("mov\n");
+            instruction = I_MOV;
+            want_modrm = true;
+        }
+        else if (0x8D == opcode)
+        {
+            log("lea\n");
+            instruction = I_LEA;
+            want_modrm = true;
+        }
+        else if (0x8e == opcode)
+        {
+            log("movseg\n");
+            want_modrm = true;
+        }
+        else if (0x9C == opcode)
+        {
+            log("pushf\n");
+        }
+        else if (0xcf == opcode)
+        {
+            log("iret\n");
+            break;
+        }
+        else if (0xff == opcode)
+        {
+            log("group\n");
+            want_modrm = true;
+        }
+        else if (0x83 == opcode)
+        {
+            log("sub\n");
+            instruction = I_SUB;
+            want_modrm = true;
+            want_imm8 = true;
+        }
+        else
+        {
+            log("unknown opcode: %02x???\n", opcode);
+            return result;
+        }
+
+        if (want_modrm)
+        {
+            uint8_t modrm = *p;
+            log("\tmodrm: %02x\n", modrm);
+            consume(1);
+
+            uint8_t mod = (modrm & 0xC0) >> 6;
+            uint8_t reg = (modrm & 0x38) >> 3;
+            uint8_t rm  = (modrm & 0x07);
+
+            log("\tmod: %02x, reg: %02x, rm: %02x\n", mod, reg, rm);
+
+            if (mod != 3 && rm == 4)
+            {
+                log("\tsib: %02x\n", *p);
+                consume(1);
+            }
+
+            switch (mod)
+            {
+                case 1:
+                    log("\tdisp8: %02x\n", *p);
+                    consume(1);
+                    break;
+                case 2:
+                    log("\tdisp32: %08x\n", *(unsigned*)p);
+                    consume(4);
+                    break;
+                case 3:
+                    log("\treg: %02x\n", rm);
+                    break;
+                default:
+                    log("unkn\n");
+                    break;
+            }
+        }
+
+        if (want_imm8)
+        {
+            log("\timm8: %02x\n", *p);
+            consume(1);
+        }
+    }
+
+    result.count = (int) (p - code) - result.shift;
+
+    return result;
+}
+
+// MARK: Analysis
+
 static uint64_t findSyscallInLibc(UnixFile& ram, int pid)
 {
 	uint64_t ret = findFunction(pid, ram, "libc.so.6", "syscall");
@@ -602,7 +830,8 @@ static uint64_t findSyscallInLibc(UnixFile& ram, int pid)
 
     {
         uint8_t code[64];
-        ram.pread(sizeof(code), ret, code);
+        if (!ram.pread(sizeof(code), ret, code))
+            return 0;
 
         // search for 'syscall'
         const uint8_t sc[] = { 0x0f, 0x05 };
@@ -645,6 +874,17 @@ static std::vector<pid_t> searchProcess()
 	return result;
 }
 
+// MARK: Detours
+static void writeJmp(uint8_t* code, uint64_t off)
+{
+    code[0] = 0x48;
+    code[1] = 0xb8;
+    *(uint64_t*) &code[2] = off;
+    code[10] = 0x3e;
+    code[11] = 0xFF;
+    code[12] = 0xE0;
+}
+
 int main()
 {
 	auto pids = searchProcess();
@@ -683,8 +923,37 @@ int main()
 		}
 		printf("  Mutter list windows at: %p\n", (void*) listWindowAddr);
 
-        // void* result = ptraceAllocateMemory(pid, syscallAddr, 4096);
-        // printf("   %p created\n", result);
+        struct DecompileResult decResult = decompile(ram, listWindowAddr, 13 /*need at least mov + jmp*/);
+        if (decResult.count < 0)
+            continue;
+
+        printf("   decompile count=%d shift=%d\n", decResult.count, decResult.shift);
+
+        uint64_t rwPage = ptraceAllocateMemory(pid, syscallAddr, 4096, MT_RW);
+        printf("   %p created\n", (void*) rwPage);
+        if (!rwPage)
+            continue;
+
+        uint64_t rxPage = ptraceAllocateMemory(pid, syscallAddr, 4096, MT_RX);
+        printf("   %p created\n", (void*) rxPage);
+        if (!rxPage)
+            continue;
+
+        CodePiece patchCodeWithCall = decResult.code;
+        writeJmp(patchCodeWithCall.data() + decResult.shift, listWindowAddr + decResult.shift + decResult.count);
+        if (!ptraceWriteBytes(pid, rxPage, patchCodeWithCall.data(), patchCodeWithCall.size(), 1 /*rx*/))
+        {
+            log("   Failed to write to rx page\n");
+        }
+
+        ptraced.moveThreadsOutOfRedzone(listWindowAddr + decResult.shift, listWindowAddr + decResult.shift + decResult.count);
+
+        CodePiece mutterCodeWithHook = decResult.code;
+        writeJmp(mutterCodeWithHook.data() + decResult.shift + decResult.count, rxPage + decResult.shift);
+        if (!ptraceWriteBytes(pid, listWindowAddr, mutterCodeWithHook.data(), mutterCodeWithHook.size(), 1 /*rx*/))
+        {
+            log("   Failed to write detour\n");
+        }
 	}
 
 	return 0;
