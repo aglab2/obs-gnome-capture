@@ -75,41 +75,20 @@ struct Ptraced
 public:
 	Ptraced(pid_t pid)
 	{
-		if (0 != processStop(pid)) return;
+		// if (0 != processStop(pid)) return;
+        if (0 != ptraceAttach(pid))
+        {
+            // processCont(pid);
+            return;
+        }
 		pid_ = pid;
-
-        char line[128];
-        sprintf(line, "/proc/%d/task", pid_);
-        if (DIR* dir = opendir(line))
-        {
-            while (auto entry = readdir(dir))
-            {
-                pid_t tid = atoi(entry->d_name);
-                if (!tid)
-                    continue;
-
-                threads_.push_back(tid);
-            }
-
-            closedir(dir);
-        }
-
-        for (auto tid : threads_)
-        {
-            log("Attaching to %d\n", tid);
-            ptraceAttach(tid);
-        }
 	}
 	~Ptraced()
 	{
 		if (!pid_) return;
 
-        for (auto tid : threads_)
-        {
-    		ptraceDetach(tid);
-        }
-
-		processCont(pid_);
+        ptraceDetach(pid_);
+		// processCont(pid_);
 	}
 
 	explicit operator bool() { return 0 != pid_; }
@@ -118,35 +97,31 @@ public:
 
 private:
 	pid_t pid_;
-	std::vector<pid_t> threads_;
 };
 
 void Ptraced::moveThreadsOutOfRedzone(uint64_t start, uint64_t end)
 {
-    for (auto pid : threads_)
+    while (1)
     {
-        while (1)
+        struct user_regs_struct orig;
+        if (ptrace(PTRACE_GETREGS, pid_, NULL, &orig) < 0)
+            break;
+        
+        if (start <= orig.rip && orig.rip <= end)
         {
-            struct user_regs_struct orig;
-            if (ptrace(PTRACE_GETREGS, pid, NULL, &orig) < 0)
+            log("Advancing thread %d to get out of red zone\n", pid_);
+            if (ptrace(PTRACE_SINGLESTEP, pid_, NULL, NULL) < 0)
                 break;
-            
-            if (start <= orig.rip && orig.rip <= end)
-            {
-                log("Advancing thread %d to get out of red zone\n", pid);
-                if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) < 0)
-                    break;
 
-                int status;
-                if (waitpid(pid, &status, 0) == -1)
-                    break;
-
-                // continue checking -> to while(1)
-            }
-            else
-            {
+            int status;
+            if (waitpid(pid_, &status, 0) == -1)
                 break;
-            }
+
+            // continue checking -> to while(1)
+        }
+        else
+        {
+            break;
         }
     }
 }
@@ -169,7 +144,7 @@ static uint64_t ptraceAllocateMemory(pid_t pid, uint64_t syscallAddr, size_t siz
 	work.rax  = __NR_mmap;
 	work.rdi  = (uint64_t)NULL;
 	work.rsi  = size;
-	work.rdx  = mt == MT_RW ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);
+	work.rdx  = mt == MT_RW ? (PROT_READ | PROT_EXEC) : (PROT_READ | PROT_EXEC);
 	work.r10  = MAP_PRIVATE | MAP_ANONYMOUS;
 	work.r8   = -1;
 	work.r9   = 0;
@@ -190,6 +165,7 @@ static uint64_t ptraceAllocateMemory(pid_t pid, uint64_t syscallAddr, size_t siz
 		return 0;
 
 	uint64_t result = work.rax;
+    log("%lu\n", result);
 
 	work.rip = orig.rip;
 	work.rax = orig.rax;
