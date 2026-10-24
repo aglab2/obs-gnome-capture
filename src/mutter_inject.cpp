@@ -144,7 +144,7 @@ static uint64_t ptraceAllocateMemory(pid_t pid, uint64_t syscallAddr, size_t siz
 	work.rax  = __NR_mmap;
 	work.rdi  = (uint64_t)NULL;
 	work.rsi  = size;
-	work.rdx  = mt == MT_RW ? (PROT_READ | PROT_EXEC) : (PROT_READ | PROT_EXEC);
+	work.rdx  = mt == MT_RW ? (PROT_READ | PROT_WRITE) : (PROT_READ | PROT_EXEC);
 	work.r10  = MAP_PRIVATE | MAP_ANONYMOUS;
 	work.r8   = -1;
 	work.r9   = 0;
@@ -220,7 +220,7 @@ static char *ptrace_read_string(pid_t pid, void *addr)
 }
 #endif
 
-static bool ptraceWriteBytes(pid_t pid, uint64_t dest, const uint8_t *src, size_t len, bool rx)
+static bool ptraceWriteBytes(pid_t pid, uint64_t dest, const void* src, size_t len, bool rx)
 {
     if (len % sizeof(long) != 0)
     {
@@ -231,7 +231,7 @@ static bool ptraceWriteBytes(pid_t pid, uint64_t dest, const uint8_t *src, size_
 	size_t offset = 0;
 	while (offset < len) {
 		size_t copy = sizeof(long);
-		if (ptrace(rx ? PTRACE_POKETEXT : PTRACE_POKEDATA, pid, (char *)dest + offset, *(long*)(src + offset)) < 0) {
+		if (ptrace(rx ? PTRACE_POKETEXT : PTRACE_POKEDATA, pid, (char *)dest + offset, *(long*)((const uint8_t*)src + offset)) < 0) {
 			log("ptrace_write_bytes: POKETEXT failed\n");
 			return false;
 		}
@@ -972,31 +972,31 @@ int main()
 
         // 0x100
         uint8_t content[128] = {
-            0x55,                      // push rbp
-            0x48, 0x89, 0xe5,          // mov rbp, rsp
-            0x48, 0x8b, 0x0d, 0,0,0,0, // mov rcx, off[rip] <- rwPage at 0xf0c
-            0x48, 0x8b, 0x01,          // mov rax, [rcx]
-            0x48, 0x85, 0xc0,          // test rax, rax
-            0x0f, 0x85, 0,0,0,0,       // jne offset
+            0x55,                                  // push rbp
+            0x48, 0x89, 0xe5,                      // mov rbp, rsp
+            0x48, 0x8b, 0x0d, 0x0d,0x0e,0x00,0x00, // mov rcx, [rip+disp32] <- rwPage at 0xf18
+            0x48, 0x8b, 0x01,                      // mov rax, [rcx]
+            0x48, 0x85, 0xc0,                      // test rax, rax
+            0x0f, 0x85, 0x32,0x00,0x00,0x00,       // jne <- lea rdx at 0x49
 
-            0x57,                      // push rdi
-            0x56,                      // push rsi
-            0x48, 0x8d, 0x3d, 0,0,0,0, // lea rdi, [rip+off] <- filename at 0xe00
-            0x48, 0xc7, 0xc6, 1,0,0,0, // mov rsi,1
-            0xff, 0x15, 0,0,0,0,       // call off[rip]      <- dlopen at 0xf04
-            0x48, 0x89, 0xc7,          // mov rdi,rax
-            0x48, 0x8d, 0x35, 0,0,0,0, // lea rsi, [rip+off] <- symname at 0xd00
-            0xff, 0x15, 0,0,0,0,       // call off[rip]      <- dlsym at 0xf08
-            0x48, 0x8b, 0x0d, 0,0,0,0, // mov rcx, off[rip]  <- rwPage at 0xf0c
-            0x48, 0x8b, 0x01,          // mov [rcx], rax
-            0x5e,                      // pop rsi
-            0x5f,                      // pop rdi
+            0x57,                                  // push rdi
+            0x56,                                  // push rsi
+            0x48, 0x8d, 0x3d, 0xe0,0x0c,0x00,0x00, // lea rdi, [rip+disp32] <- filename at 0xe00
+            0x48, 0xc7, 0xc6, 1,0,0,0,             // mov rsi,1
+            0xff, 0x15, 0xdb,0x0d,0x00,0x00,       // call [rip+disp32]    <- dlopen at 0xf08
+            0x48, 0x89, 0xc7,                      // mov rdi,rax
+            0x48, 0x8d, 0x35, 0xc9,0x0b,0x00,0x00, // lea rsi, [rip+disp32] <- symname at 0xd00
+            0xff, 0x15, 0xd3,0x0d,0x00,0x00,       // call [rip+disp32]    <- dlsym at 0xf10
+            0x48, 0x8b, 0x0d, 0xd4,0x0d,0x00,0x00, // mov rcx, [rip+disp32] <- rwPage at 0xf18
+            0x48, 0x89, 0x01,                      // mov [rcx], rax
+            0x5e,                                  // pop rsi
+            0x5f,                                  // pop rdi
 
             // rax jne here
-            0x48, 0x8d, 0x15, 0,0,0,0, // lea rdx, off[rip]  <- orig fn trampoline
-            0xff, 0xd0,                // call rax
-            0x5d,                      // pop rbp
-            0xc3,                      // ret
+            0x48, 0x8d, 0x15, 0xb0,0x0d,0x00,0x00, // lea rdx, [rip+disp32] <- orig fn at 0xf00
+            0xff, 0xd0,                            // call rax
+            0x5d,                                  // pop rbp
+            0xc3,                                  // ret
         };
 
         if (!ptraceWriteBytes(pid, rxPage + 0x100, content, sizeof(content), 1 /*rx*/))
@@ -1009,19 +1009,19 @@ int main()
         supplPointers[1] = libcRecon.dlopen;
         supplPointers[2] = libcRecon.dlsym;
         supplPointers[3] = rwPage;
-        if (!ptraceWriteBytes(pid, rxPage + 0xf00, (const uint8_t*) supplPointers, sizeof(supplPointers), 1 /*rx*/))
+        if (!ptraceWriteBytes(pid, rxPage + 0xf00, supplPointers, sizeof(supplPointers), 1 /*rx*/))
         {
             log("   Failed to write to rx page supplementary pointers\n");
         }
 
         static const char dlpath[40] = "/usr/local/bin/libmutter_inject.so";
-        if (!ptraceWriteBytes(pid, rxPage + 0xe00, (const uint8_t*) dlpath, sizeof(dlpath), 1 /*rx*/))
+        if (!ptraceWriteBytes(pid, rxPage + 0xe00, dlpath, sizeof(dlpath), 1 /*rx*/))
         {
             log("   Failed to write to rx page dlpath\n");
         }
 
         static const char dlsymName[40] = "meta_display_list_window_detour";
-        if (!ptraceWriteBytes(pid, rxPage + 0xd00, (const uint8_t*) dlpath, sizeof(dlpath), 1 /*rx*/))
+        if (!ptraceWriteBytes(pid, rxPage + 0xd00, dlsymName, sizeof(dlsymName), 1 /*rx*/))
         {
             log("   Failed to write to rx page dlsymName\n");
         }
