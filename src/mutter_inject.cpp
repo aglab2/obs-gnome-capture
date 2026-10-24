@@ -875,7 +875,7 @@ static std::vector<pid_t> searchProcess()
 }
 
 // MARK: Detours
-static void writeJmp(uint8_t* code, uint64_t off)
+static void writeJmpViaRAX(uint8_t* code, uint64_t off)
 {
     code[0] = 0x48;
     code[1] = 0xb8;
@@ -883,6 +883,14 @@ static void writeJmp(uint8_t* code, uint64_t off)
     code[10] = 0x3e;
     code[11] = 0xFF;
     code[12] = 0xE0;
+}
+
+static void writeJmpViaRIP(uint8_t* code, uint64_t codeRip, uint64_t targetRip)
+{
+    code[0] = 0x3e;
+    code[1] = 0xff;
+    code[2] = 0x25;
+    *(uint32_t*) &code[3] = (uint32_t) (targetRip - (codeRip + 7));
 }
 
 int main()
@@ -904,11 +912,11 @@ int main()
 			}
 		}
 
+        // Prepare and recon info about process
 		Ptraced ptraced(pid);
 		if (!ptraced)
 			continue;
 
-        // Find syscall instruction in libc
         uint64_t syscallAddr = findSyscallInLibc(ram, pid);
         if (!syscallAddr) {
             log("  Failed to find syscall in libc\n");
@@ -929,27 +937,37 @@ int main()
 
         printf("   decompile count=%d shift=%d\n", decResult.count, decResult.shift);
 
-        uint64_t rwPage = ptraceAllocateMemory(pid, syscallAddr, 4096, MT_RW);
+        uint64_t rwPage = ptraceAllocateMemory(pid, syscallAddr, 0x1000, MT_RW);
         printf("   %p created\n", (void*) rwPage);
         if (!rwPage)
             continue;
 
-        uint64_t rxPage = ptraceAllocateMemory(pid, syscallAddr, 4096, MT_RX);
+        uint64_t rxPage = ptraceAllocateMemory(pid, syscallAddr, 0x1000, MT_RX);
         printf("   %p created\n", (void*) rxPage);
         if (!rxPage)
             continue;
 
+        // make rx page with hook
         CodePiece patchCodeWithCall = decResult.code;
-        writeJmp(patchCodeWithCall.data() + decResult.shift, listWindowAddr + decResult.shift + decResult.count);
+        writeJmpViaRIP(patchCodeWithCall.data() + decResult.shift + decResult.count
+                     , rxPage                   + decResult.shift + decResult.count
+                     , rxPage + 0xf00);
         if (!ptraceWriteBytes(pid, rxPage, patchCodeWithCall.data(), patchCodeWithCall.size(), 1 /*rx*/))
         {
             log("   Failed to write to rx page\n");
         }
 
-        ptraced.moveThreadsOutOfRedzone(listWindowAddr + decResult.shift, listWindowAddr + decResult.shift + decResult.count);
+        uint64_t supplPointers[4];
+        supplPointers[0] = listWindowAddr + decResult.shift + decResult.count;
+        if (!ptraceWriteBytes(pid, rxPage + 0xf00, (const uint8_t*) supplPointers, sizeof(supplPointers), 1 /*rx*/))
+        {
+            log("   Failed to write to rx page supplementary pointers\n");
+        }
 
+        // write detour to rx page
+        ptraced.moveThreadsOutOfRedzone(listWindowAddr + decResult.shift, listWindowAddr + decResult.shift + decResult.count);
         CodePiece mutterCodeWithHook = decResult.code;
-        writeJmp(mutterCodeWithHook.data() + decResult.shift + decResult.count, rxPage + decResult.shift);
+        writeJmpViaRAX(mutterCodeWithHook.data() + decResult.shift, rxPage + decResult.shift);
         if (!ptraceWriteBytes(pid, listWindowAddr, mutterCodeWithHook.data(), mutterCodeWithHook.size(), 1 /*rx*/))
         {
             log("   Failed to write detour\n");
