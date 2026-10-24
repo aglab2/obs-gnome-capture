@@ -451,20 +451,20 @@ static const char* safeStr(const std::vector<char>& buf, size_t offset, size_t l
     return buf.data() + offset;
 }
 
-static uint64_t findFunction(int pid, UnixFile& ram, const char* library, const char* symname)
+static std::vector<uint64_t> findFunction(int pid, UnixFile& ram, const char* library, std::vector<const char*> symnames)
 {
+    std::vector<uint64_t> result;
     std::string libPath;
     uint64_t elfloc = 0;
 
     Section xloc{};
     std::vector<Section> sections;
-    uint64_t ret = 0;
 
     {
         ProcfsMapIter iter{ pid, library };
         if (!iter)
         {
-            return ret;
+            return result;
         }
 
         while (struct ProcfsMapEntry* entry = iter.next())
@@ -500,7 +500,7 @@ static uint64_t findFunction(int pid, UnixFile& ram, const char* library, const 
     if (!elfloc || !xloc.start || !xloc.end)
     {
         log("Failed to find %s in process %d\n", library, pid);
-        return ret;
+        return result;
     }
 
     std::vector<Elf64_Shdr> shdrs;
@@ -521,13 +521,13 @@ static uint64_t findFunction(int pid, UnixFile& ram, const char* library, const 
         if (!ram.pread(sizeof(ehdr), elfloc, &ehdr))
         {
             log("Failed to read ELF header from %s in process %d\n", library, pid);
-            return ret;
+            return result;
         }
 
         if (ehdr.e_ident[0] != 0x7f || ehdr.e_ident[1] != 'E' || ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F')
         {
             log("Failed to read ELF header from %s in process %d\n", library, pid);
-            return ret;
+            return result;
         }
     }
 
@@ -538,13 +538,13 @@ static uint64_t findFunction(int pid, UnixFile& ram, const char* library, const 
         if (!lib)
         {
             log("Failed to open %s at '%s'\n", library, libPath.c_str());
-            return ret;
+            return result;
         }
 
         if (!lib.pread(ehdr.e_shnum * sizeof(Elf64_Shdr), ehdr.e_shoff, shdrs.data()))
         {
             log("Failed to read section headers from %s\n", library);
-            return ret;
+            return result;
         }
     }
 
@@ -569,7 +569,7 @@ static uint64_t findFunction(int pid, UnixFile& ram, const char* library, const 
     if (!dynsym || !strtab)
     {
         log("Failed to find dynsym or strtab in %s\n", library);
-        return ret;
+        return result;
     }
 
     // Load in from RAM the dynsym and strtab sections so we can iterate over them and find the symbols we want
@@ -578,23 +578,24 @@ static uint64_t findFunction(int pid, UnixFile& ram, const char* library, const 
     if (!dynsymSec || !strtabSec)
     {
         log("Failed to find dynsym or strtab in mapped sections\n");
-        return ret;
+        return result;
     }
 
     sym_table = (Elf64_Sym*) malloc(dynsym->sh_size);
     if (!ram.pread(dynsym->sh_size, dynsymSec->start + (dynsym->sh_offset - dynsymSec->offset), sym_table))
     {
         log("Failed to read dynsym from process %d\n", pid);
-        return ret;
+        return result;
     }
 
     str_table.resize(strtab->sh_size);
     if (!ram.pread(strtab->sh_size, strtabSec->start + (strtab->sh_offset - strtabSec->offset), str_table.data()))
     {
         log("Failed to read strtab from process %d\n", pid);
-        return ret;
+        return result;
     }
 
+    result.resize(symnames.size());
     size_t total_symbols = dynsym->sh_size / sizeof(Elf64_Sym);
     for (size_t i = 0; i < total_symbols; i++) {
         if (sym_table[i].st_name == 0)
@@ -604,23 +605,25 @@ static uint64_t findFunction(int pid, UnixFile& ram, const char* library, const 
         if (!sym_name)
             continue;
 
-        if (strcmp(sym_name, symname) == 0)
+        for (size_t j = 0; j < symnames.size(); j++)
         {
-            ret = xloc.start + sym_table[i].st_value - xloc.offset;
-            if (ret > xloc.end)
+            const char* symname = symnames[j];
+            if (strcmp(sym_name, symname) == 0)
             {
-                log("Found %s outside of %s mapping\n", symname, library);
-                ret = 0;
+                uint64_t ret = xloc.start + sym_table[i].st_value - xloc.offset;
+                if (ret > xloc.end)
+                {
+                    log("Found %s outside of %s mapping\n", symname, library);
+                }
+                else
+                {
+                    result[j] = ret;
+                }
             }
         }
     }
 
-    if (!ret) {
-		log("Fail\n");
-        return 0;
-	}
-
-    return ret;
+    return result;
 }
 
 enum Instruction
@@ -822,33 +825,54 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
 
 // MARK: Analysis
 
-static uint64_t findSyscallInLibc(UnixFile& ram, int pid)
+struct LibcRecon
 {
-	uint64_t ret = findFunction(pid, ram, "libc.so.6", "syscall");
-	if (!ret)
-		return 0;
+    uint64_t syscall;
+    uint64_t dlopen;
+    uint64_t dlsym;
+};
 
+static struct LibcRecon reconLibc(UnixFile& ram, int pid)
+{
+    struct LibcRecon result{};
+
+	auto ret = findFunction(pid, ram, "libc.so.6", { "syscall", "dlopen", "dlsym" });
+	if (ret.size() != 3)
+    {
+        log("Incorrect return size\n");
+		return {};
+    }
+
+    result.syscall = ret[0];
+    result.dlopen  = ret[1];
+    result.dlsym   = ret[2];
+
+    if (result.syscall)
     {
         uint8_t code[64];
-        if (!ram.pread(sizeof(code), ret, code))
-            return 0;
+        if (!ram.pread(sizeof(code), result.syscall, code))
+            return {};
 
         // search for 'syscall'
         const uint8_t sc[] = { 0x0f, 0x05 };
 
         uint8_t* at = (uint8_t*)memmem(code, sizeof(code), sc, sizeof(sc));
         if (!at)
-            return 0;
+            return {};
         
-        ret += at - code;
+        result.syscall += at - code;
     }
 
-    return ret;
+    return result;
 }
 
 static uint64_t findListWindowsInMutter(UnixFile& ram, int pid)
 {
-	return findFunction(pid, ram, "libmutter-18.so", "meta_display_list_windows");
+	auto ret = findFunction(pid, ram, "libmutter-18.so", { "meta_display_list_windows" });
+    if (ret.size() != 1)
+        return 0;
+
+    return ret[0];
 }
 
 static std::vector<pid_t> searchProcess()
@@ -917,11 +941,24 @@ int main()
 		if (!ptraced)
 			continue;
 
-        uint64_t syscallAddr = findSyscallInLibc(ram, pid);
-        if (!syscallAddr) {
+        struct LibcRecon libcRecon = reconLibc(ram, pid);
+        if (!libcRecon.syscall) {
             log("  Failed to find syscall in libc\n");
             continue;
         }
+
+        if (!libcRecon.dlopen) {
+            log("  Failed to find dlopen in libc\n");
+            continue;
+        }
+
+        if (!libcRecon.dlsym) {
+            log("  Failed to find dlsym in libc\n");
+            continue;
+        }
+
+        uint64_t syscallAddr = libcRecon.syscall;
+
         printf("  Syscall instruction at: %p\n", (void*)syscallAddr);
 
 		uint64_t listWindowAddr = findListWindowsInMutter(ram, pid);
@@ -959,6 +996,8 @@ int main()
 
         uint64_t supplPointers[4];
         supplPointers[0] = listWindowAddr + decResult.shift + decResult.count;
+        supplPointers[1] = libcRecon.dlopen;
+        supplPointers[2] = libcRecon.dlsym;
         if (!ptraceWriteBytes(pid, rxPage + 0xf00, (const uint8_t*) supplPointers, sizeof(supplPointers), 1 /*rx*/))
         {
             log("   Failed to write to rx page supplementary pointers\n");
