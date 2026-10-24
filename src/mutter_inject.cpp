@@ -32,29 +32,91 @@
 
 static int ptraceAttach(pid_t pid)
 {
-	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
-		perror("ptrace_attach: PTRACE_ATTACH failed");
+	if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0)
+    {
+		perror("ptraceAttach: PTRACE_ATTACH failed");
 		return -1;
 	}
 
 	int status;
-	if (waitpid(pid, &status, 0) == -1) {
-		perror("ptrace_attach: waitpid failed");
+	if (waitpid(pid, &status, 0) == -1)
+    {
+		log("ptraceAttach: waitpid failed?\n");
 		return -1;
 	}
 
-	if (!WIFSTOPPED(status)) {
-		fprintf(stderr, "process %d did not stop as expected\n", pid);
+	if (!WIFSTOPPED(status))
+    {
+		log("ptraceAttach: process %d did not stop as expected\n", pid);
 		return -1;
 	}
 
-	return 0;
+    return 0;
 }
 
 static void ptraceDetach(pid_t pid)
 {
 	ptrace(PTRACE_DETACH, pid, NULL, NULL);
 }
+
+static int processStop(pid_t pid)
+{
+    return kill(pid, SIGSTOP);
+}
+
+static void processCont(pid_t pid)
+{
+	kill(pid, SIGCONT);
+}
+
+struct Ptraced
+{
+public:
+	Ptraced(pid_t pid)
+	{
+		if (0 != processStop(pid)) return;
+		pid_ = pid;
+
+        char line[128];
+        sprintf(line, "/proc/%d/task", pid_);
+        if (DIR* dir = opendir(line))
+        {
+            while (auto entry = readdir(dir))
+            {
+                pid_t tid = atoi(entry->d_name);
+                if (!tid)
+                    continue;
+
+                threads_.push_back(tid);
+            }
+
+            closedir(dir);
+        }
+
+        for (auto tid : threads_)
+        {
+            log("Attaching to %d\n", tid);
+            ptraceAttach(tid);
+        }
+	}
+	~Ptraced()
+	{
+		if (!pid_) return;
+
+        for (auto tid : threads_)
+        {
+    		ptraceDetach(tid);
+        }
+
+		processCont(pid_);
+	}
+
+	explicit operator bool() { return 0 != pid_; } 
+
+private:
+	pid_t pid_;
+	std::vector<pid_t> threads_;
+};
 
 // MARK: alloc memory via ptrace
 
@@ -149,6 +211,28 @@ static void ptrace_write_string(pid_t pid, long *addr, long val)
 		perror("ptrace_write_string: POKETEXT failed");
 		return;
 	}
+}
+
+// Write a block of bytes to the target process via ptrace POKETEXT
+static bool ptrace_write_bytes(pid_t pid, void *dest, const uint8_t *src, size_t len)
+{
+	size_t offset = 0;
+	while (offset < len) {
+		long val = 0;
+		size_t copy = sizeof(val);
+		if (offset + copy > len)
+			copy = len - offset;
+
+		memset(&val, 0, sizeof(val));
+		memcpy(&val, src + offset, copy);
+
+		if (ptrace(PTRACE_POKETEXT, pid, (void *)((char *)dest + offset), (void *)&val) < 0) {
+			perror("ptrace_write_bytes: POKETEXT failed");
+			return false;
+		}
+		offset += copy;
+	}
+	return true;
 }
 
 // MARK: procfs parser
@@ -338,18 +422,17 @@ static const char* safeStr(const std::vector<char>& buf, size_t offset, size_t l
     return buf.data() + offset;
 }
 
-uint64_t findSyscallInLibc(int pid)
+static uint64_t findFunction(int pid, UnixFile& ram, const char* library, const char* symname)
 {
-    std::string libcPath;
+    std::string libPath;
     uint64_t elfloc = 0;
 
     Section xloc{};
     std::vector<Section> sections;
     uint64_t ret = 0;
 
-    // Discover the location of libc.so.6 in the target process's memory space
     {
-        ProcfsMapIter iter{ pid, "libc.so.6" };
+        ProcfsMapIter iter{ pid, library };
         if (!iter)
         {
             return ret;
@@ -359,15 +442,15 @@ uint64_t findSyscallInLibc(int pid)
         {
             if (!entry->pathname.size())
             {
-                log("Found libc: %" PRIx64 " %" PRIx64 "-%" PRIx64 " %.4s (no pathname?)\n", entry->offset, entry->start, entry->end, entry->perms);
+                log("Found: %" PRIx64 " %" PRIx64 "-%" PRIx64 " %.4s (no pathname?)\n", entry->offset, entry->start, entry->end, entry->perms);
                 continue;
             }
 
-            log("Found libc: %" PRIx64 " %" PRIx64 "-%" PRIx64 " %.4s\n", entry->offset, entry->start, entry->end, entry->perms);
+            log("Found: %" PRIx64 " %" PRIx64 "-%" PRIx64 " %.4s\n", entry->offset, entry->start, entry->end, entry->perms);
             if (0 == entry->offset)
             {
                 elfloc = entry->start;
-                libcPath = entry->pathname;
+                libPath = entry->pathname;
             }
 
             if (entry->perms[2] == 'x')
@@ -387,11 +470,10 @@ uint64_t findSyscallInLibc(int pid)
 
     if (!elfloc || !xloc.start || !xloc.end)
     {
-        log("Failed to find libc.so.6 in process %d\n", pid);
+        log("Failed to find %s in process %d\n", library, pid);
         return ret;
     }
 
-    UnixFile ram;
     std::vector<Elf64_Shdr> shdrs;
 
     Elf64_Sym* sym_table = NULL;
@@ -404,30 +486,18 @@ uint64_t findSyscallInLibc(int pid)
 
     std::vector<char> str_table;
 
-    // Analyze and prove that we have libc decently mapped by reading the ELF header and section headers
-    {
-        char path[64] = {0};
-        snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-        ram = open(path, O_RDONLY);
-        if (!ram)
-        {
-            log("Failed to open /proc/%d/mem\n", pid);
-            return ret;
-        }
-    }
-
     // Start reading ELF
     Elf64_Ehdr ehdr;
     {
         if (!ram.pread(sizeof(ehdr), elfloc, &ehdr))
         {
-            log("Failed to read ELF header from libc.so.6 in process %d\n", pid);
+            log("Failed to read ELF header from %s in process %d\n", library, pid);
             return ret;
         }
 
         if (ehdr.e_ident[0] != 0x7f || ehdr.e_ident[1] != 'E' || ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F')
         {
-            log("Failed to read ELF header from libc.so.6 in process %d\n", pid);
+            log("Failed to read ELF header from %s in process %d\n", library, pid);
             return ret;
         }
     }
@@ -435,16 +505,16 @@ uint64_t findSyscallInLibc(int pid)
     // shdrs are not actually mapped in memory so we have to open the file and read them from disk
     shdrs.resize(ehdr.e_shnum);
     {
-        UnixFile libc = open(libcPath.c_str(), O_RDONLY);
-        if (!libc)
+        UnixFile lib = open(libPath.c_str(), O_RDONLY);
+        if (!lib)
         {
-            log("Failed to open libc.so.6 at '%s'\n", libcPath.c_str());
+            log("Failed to open %s at '%s'\n", library, libPath.c_str());
             return ret;
         }
 
-        if (!libc.pread(ehdr.e_shnum * sizeof(Elf64_Shdr), ehdr.e_shoff, shdrs.data()))
+        if (!lib.pread(ehdr.e_shnum * sizeof(Elf64_Shdr), ehdr.e_shoff, shdrs.data()))
         {
-            log("Failed to read section headers from libc.so.6\n");
+            log("Failed to read section headers from %s\n", library);
             return ret;
         }
     }
@@ -469,7 +539,7 @@ uint64_t findSyscallInLibc(int pid)
 
     if (!dynsym || !strtab)
     {
-        log("Failed to find dynsym or strtab in libc.so.6\n");
+        log("Failed to find dynsym or strtab in %s\n", library);
         return ret;
     }
 
@@ -505,19 +575,30 @@ uint64_t findSyscallInLibc(int pid)
         if (!sym_name)
             continue;
 
-        if (strcmp(sym_name, "syscall") == 0)
+        if (strcmp(sym_name, symname) == 0)
         {
             ret = xloc.start + sym_table[i].st_value - xloc.offset;
             if (ret > xloc.end)
             {
-                log("Found syscall outside of libc.so.6 mapping\n");
+                log("Found %s outside of %s mapping\n", symname, library);
                 ret = 0;
             }
         }
     }
 
-    if (!ret)
+    if (!ret) {
+		log("Fail\n");
         return 0;
+	}
+
+    return ret;
+}
+
+static uint64_t findSyscallInLibc(UnixFile& ram, int pid)
+{
+	uint64_t ret = findFunction(pid, ram, "libc.so.6", "syscall");
+	if (!ret)
+		return 0;
 
     {
         uint8_t code[64];
@@ -534,6 +615,11 @@ uint64_t findSyscallInLibc(int pid)
     }
 
     return ret;
+}
+
+static uint64_t findListWindowsInMutter(UnixFile& ram, int pid)
+{
+	return findFunction(pid, ram, "libmutter-18.so", "meta_display_list_windows");
 }
 
 static std::vector<pid_t> searchProcess()
@@ -566,22 +652,39 @@ int main()
 	for (auto pid : pids)
 	{
 		printf("%d\n", pid);
-		if (ptraceAttach(pid) < 0)
+		UnixFile ram;
+		{
+			char path[64] = {0};
+			snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+			ram = open(path, O_RDONLY);
+			if (!ram)
+			{
+				log("Failed to open /proc/%d/mem\n", pid);
+				continue;
+			}
+		}
+
+		Ptraced ptraced(pid);
+		if (!ptraced)
 			continue;
 
         // Find syscall instruction in libc
-        uint64_t syscallAddr = findSyscallInLibc(pid);
+        uint64_t syscallAddr = findSyscallInLibc(ram, pid);
         if (!syscallAddr) {
             log("  Failed to find syscall in libc\n");
-            ptraceDetach(pid);
             continue;
         }
         printf("  Syscall instruction at: %p\n", (void*)syscallAddr);
 
-        void* result = ptraceAllocateMemory(pid, syscallAddr, 4096);
-        printf("   %p created\n", result);
+		uint64_t listWindowAddr = findListWindowsInMutter(ram, pid);
+		if (!listWindowAddr) {
+			log("   Failed to find list windows in mutter\n");
+			continue;
+		}
+		printf("  Mutter list windows at: %p\n", (void*) listWindowAddr);
 
-		ptraceDetach(pid);
+        // void* result = ptraceAllocateMemory(pid, syscallAddr, 4096);
+        // printf("   %p created\n", result);
 	}
 
 	return 0;
