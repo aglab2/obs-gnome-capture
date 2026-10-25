@@ -45,6 +45,17 @@ set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_nam
 
 add_executable(mutter_inject src/mutter_inject.cpp)
 
+add_library(mutter_list_windows SHARED src/mutter_list_windows.c)
+target_link_libraries(mutter_list_windows PRIVATE gio::gio)
+set_target_properties(mutter_list_windows PROPERTIES
+    OUTPUT_NAME mutter_list_windows
+    POSITION_INDEPENDENT_CODE ON
+)
+
 install(
   TARGETS mutter_inject
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+install(
+  TARGETS mutter_list_windows
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})

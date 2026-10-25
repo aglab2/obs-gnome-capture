@@ -96,7 +96,7 @@ public:
     void moveThreadsOutOfRedzone(uint64_t start, uint64_t end);
 
 private:
-	pid_t pid_;
+	pid_t pid_ = 0;
 };
 
 void Ptraced::moveThreadsOutOfRedzone(uint64_t start, uint64_t end)
@@ -993,7 +993,7 @@ int main()
             0x5f,                                  // pop rdi
 
             // rax jne here
-            0x48, 0x8d, 0x15, 0xb0,0x0d,0x00,0x00, // lea rdx, [rip+disp32] <- orig fn at 0xf00
+            0x48, 0x8d, 0x15, 0xb0,0xfe,0xff,0xff, // lea rdx, [rip+disp32] <- orig fn at 0
             0xff, 0xd0,                            // call rax
             0x5d,                                  // pop rbp
             0xc3,                                  // ret
@@ -1014,7 +1014,7 @@ int main()
             log("   Failed to write to rx page supplementary pointers\n");
         }
 
-        static const char dlpath[40] = "/usr/local/bin/libmutter_inject.so";
+        static const char dlpath[64] = "/usr/local/bin/libmutter_list_windows.so";
         if (!ptraceWriteBytes(pid, rxPage + 0xe00, dlpath, sizeof(dlpath), 1 /*rx*/))
         {
             log("   Failed to write to rx page dlpath\n");
