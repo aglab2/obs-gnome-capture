@@ -608,22 +608,32 @@ enum Instruction
     I_MOV,
     I_LEA,
     I_SUB,
+    I_CALL,
 };
 
 using CodePiece = std::array<uint8_t, 64>;
+using DecompilePiece = std::array<uint8_t, 256>;
 
 struct DecompileResult
 {
     int shift;
     int count;
-    CodePiece code;
+    uint64_t callingTo;
+    DecompilePiece code;
 };
+
+static CodePiece toCodePiece(const DecompilePiece& dp)
+{
+    CodePiece cp;
+    memcpy(cp.data(), dp.data(), cp.size());
+    return cp;
+}
 
 // MARK: Decompiling
 static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
 {
-    struct DecompileResult result;
-    result.count = -1;
+    struct DecompileResult result{};
+    result.count = 0;
 
     if (amount > 64)
         return result;
@@ -645,11 +655,28 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
         result.shift = 0;
     }
 
-#define consume(n) do { p += n; amount -= n; } while(0)
+#define consume(n) do { p += n; amount -= n; fn += n; } while(0)
 
-    while (p < end && amount >= 0)
+    while (p < end)
     {
-        log("left %d\n", amount);
+        if (amount < 0)
+        {
+            if (!result.count)
+            {
+                result.count = (int) (p - code) - result.shift;
+            }
+        }
+        else
+        {
+            log("left %d\n", amount);
+        }
+
+        uint8_t maybeSegEx = *p;
+        if (maybeSegEx == 0x64)
+        {
+            log("seg: %02x\n", maybeSegEx);
+            consume(1);
+        }
 
         uint8_t maybeRex = *p;
         if (maybeRex >= 0x40 && maybeRex <= 0x4F)
@@ -660,6 +687,8 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
 
         bool want_modrm = false;
         bool want_imm8 = false;
+        bool want_imm32 = false;
+        bool want_group = false;
 
         enum Instruction instruction = I_UNKNOWN;
 
@@ -675,6 +704,11 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
                 log("btr\n");
                 want_modrm = true;
                 want_imm8 = true;
+            }
+            else if (0x84 == opcode)
+            {
+                log("je\n");
+                want_imm32 = true;
             }
             else
             {
@@ -736,6 +770,7 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
         {
             log("group\n");
             want_modrm = true;
+            want_group = true;
         }
         else if (0x83 == opcode)
         {
@@ -743,6 +778,21 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
             instruction = I_SUB;
             want_modrm = true;
             want_imm8 = true;
+        }
+        else if (0x85 == opcode)
+        {
+            log("test\n");
+            want_modrm = true;
+        }
+        else if (0xe8 == opcode)
+        {
+            log("call\n");
+            instruction = I_CALL;
+        }
+        else if (0x31 == opcode)
+        {
+            log("xor\n");
+            want_modrm = true;
         }
         else
         {
@@ -762,28 +812,42 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
 
             log("\tmod: %02x, reg: %02x, rm: %02x\n", mod, reg, rm);
 
-            if (mod != 3 && rm == 4)
+            if (want_group)
             {
-                log("\tsib: %02x\n", *p);
-                consume(1);
+                if (mod != 0 || reg != 3 || rm != 5)
+                {
+                    log("unkn group\n");
+                }
+                else
+                {
+                    instruction = I_CALL;
+                }
             }
-
-            switch (mod)
+            else
             {
-                case 1:
-                    log("\tdisp8: %02x\n", *p);
-                    consume(1);
-                    break;
-                case 2:
-                    log("\tdisp32: %08x\n", *(unsigned*)p);
-                    consume(4);
-                    break;
-                case 3:
-                    log("\treg: %02x\n", rm);
-                    break;
-                default:
-                    log("unkn\n");
-                    break;
+                if (mod != 3 && rm == 4)
+                {
+                    log("\tsib: %02x\n", *p);
+                    consume(5);
+                }
+
+                switch (mod)
+                {
+                    case 1:
+                        log("\tdisp8: %02x\n", *p);
+                        consume(1);
+                        break;
+                    case 2:
+                        log("\tdisp32: %08x\n", *(unsigned*)p);
+                        consume(4);
+                        break;
+                    case 3:
+                        log("\treg: %02x\n", rm);
+                        break;
+                    default:
+                        log("unkn\n");
+                        break;
+                }
             }
         }
 
@@ -792,9 +856,22 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
             log("\timm8: %02x\n", *p);
             consume(1);
         }
-    }
 
-    result.count = (int) (p - code) - result.shift;
+        if (want_imm32)
+        {
+            log("\timm32: %x\n", *(int*)p);
+            consume(4);
+        }
+
+        if (I_CALL == instruction)
+        {
+            int off = *(int*)p;
+            log("\t%08x\n", off);
+            consume(4);
+            result.callingTo = off + fn;
+            break;
+        }
+    }
 
     return result;
 }
@@ -948,7 +1025,7 @@ int main()
         if (decResult.count < 0)
             continue;
 
-        printf("   decompile count=%d shift=%d\n", decResult.count, decResult.shift);
+        printf("   decompile count=%d shift=%d call=%p\n", decResult.count, decResult.shift, (void*) decResult.callingTo);
 
         uint64_t rwPage = ptraceAllocateMemory(pid, syscallAddr, 0x1000, MT_RW);
         printf("   %p created\n", (void*) rwPage);
@@ -961,7 +1038,7 @@ int main()
             continue;
 
         // make rx page with hook
-        CodePiece patchCodeWithCall = decResult.code;
+        CodePiece patchCodeWithCall = toCodePiece(decResult.code);
         writeJmpViaRIP(patchCodeWithCall.data() + decResult.shift + decResult.count
                      , rxPage                   + decResult.shift + decResult.count
                      , rxPage + 0xf00);
@@ -1004,6 +1081,9 @@ int main()
             log("   Failed to write to rx page\n");
         }
 
+        // oftentimes gcc will decide to emit an isra copy of meta_display_list_windows with META_LIST_DEFAULT inlined
+        // try to guess that it exists by looking at first few bytes of the function and doing an educated guess...
+
         uint64_t supplPointers[4];
         supplPointers[0] = listWindowAddr + decResult.shift + decResult.count;
         supplPointers[1] = libcRecon.dlopen;
@@ -1028,7 +1108,7 @@ int main()
 
         // write detour to rx page
         ptraced.moveThreadsOutOfRedzone(listWindowAddr + decResult.shift, listWindowAddr + decResult.shift + decResult.count);
-        CodePiece mutterCodeWithHook = decResult.code;
+        CodePiece mutterCodeWithHook = toCodePiece(decResult.code);
         writeJmpViaRAX(mutterCodeWithHook.data() + decResult.shift, rxPage + 0x100);
         if (!ptraceWriteBytes(pid, listWindowAddr, mutterCodeWithHook.data(), mutterCodeWithHook.size(), 1 /*rx*/))
         {
