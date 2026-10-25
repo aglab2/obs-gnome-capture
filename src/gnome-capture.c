@@ -119,8 +119,9 @@ fail:
 static void update_windows(data_t *data)
 {
 	GError *err = NULL;
-	JsonParser *parser = NULL;
-	GVariant *eval_res = NULL;
+
+	GVariant *stream_res = NULL;
+	GVariant *session_res = NULL;
 
 	memset(data->windows, 0, sizeof(data->windows));
 	data->num_windows = 0;
@@ -133,68 +134,40 @@ static void update_windows(data_t *data)
 		goto fail;
 	}
 
-	// TODO: FIXME
-	const gchar *command = "global"
-			       ".get_window_actors()"
-			       ".map(a=>a.meta_window)"
-			       ".map(w=>({class: w.get_wm_class(), id: w.get_id(), title: w.get_title()}))";
-
-	eval_res = g_dbus_connection_call_sync(dbus, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell", "Eval",
-					       g_variant_new_parsed("(%s,)", command), NULL, G_DBUS_CALL_FLAGS_NONE, -1,
-					       NULL, &err);
+	session_res = g_dbus_connection_call_sync(dbus, "org.gnome.Mutter.ScreenCast", "/org/gnome/Mutter/ScreenCast",
+						  "org.gnome.Mutter.ScreenCast", "CreateSession",
+						  g_variant_new_parsed("({'dummy' : <0>},)"), NULL,
+						  G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
 
 	if (err != NULL) {
-		blog(LOG_ERROR, "Cannot call Eval() on DBus: %s", err->message);
+		blog(LOG_ERROR, "Cannot call CreateSession() on DBus: %s", err->message);
 		g_error_free(err);
 
 		goto fail;
 	}
 
-	gboolean res = 0;
-	gchar *json = NULL;
-	g_variant_get(eval_res, "(bs)", &res, &json, NULL);
-	if (res != TRUE) {
-		blog(LOG_ERROR, "Eval() call failed");
+	gchar *session_path;
+	g_variant_get(session_res, "(o)", &session_path, NULL);
 
-		goto fail;
-	}
+	stream_res = g_dbus_connection_call_sync(
+		dbus, "org.gnome.Mutter.ScreenCast", session_path, "org.gnome.Mutter.ScreenCast.Session",
+		"RecordWindow",
+		g_variant_new_parsed("({'window-id' : <%t>, 'cursor-mode' : <%u>},)", 0, 0),
+		NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
+	
+	// expected to fail but refreshes the list
 
-	parser = json_parser_new();
-
-	json_parser_load_from_data(parser, json, -1, &err);
 	if (err != NULL) {
-		blog(LOG_ERROR, "Cannot parse JSON: %s", err->message);
+		blog(LOG_ERROR, "expected error: %s", err->message);
 		g_error_free(err);
-
-		goto fail;
-	}
-
-	JsonNode *root = json_parser_get_root(parser);
-	JsonArray *array = json_node_get_array(root);
-
-	for (guint i = 0; i < json_array_get_length(array); i++) {
-		JsonObject *object = json_array_get_object_element(array, i);
-
-		const gchar *class = json_object_get_string_member(object, "class");
-		if (g_strcmp0(class, "Gnome-shell") == 0)
-			continue;
-
-		data->windows[data->num_windows].id = json_object_get_int_member(object, "id");
-		g_strlcpy(data->windows[data->num_windows].title, json_object_get_string_member(object, "title"),
-			  sizeof(data->windows[data->num_windows].title));
-
-		data->num_windows++;
-
-		if (data->num_windows >= (gint)(sizeof(data->windows) / sizeof(window_t)))
-			break;
 	}
 
 fail:
-	if (parser != NULL)
-		g_object_unref(parser);
+	if (session_res != NULL)
+		g_variant_unref(session_res);
 
-	if (eval_res != NULL)
-		g_variant_unref(eval_res);
+	if (stream_res != NULL)
+		g_variant_unref(stream_res);
 
 	if (dbus != NULL)
 		g_object_unref(dbus);
