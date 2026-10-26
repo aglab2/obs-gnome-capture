@@ -61,5 +61,9 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
   }
 
   sudo apt-get install ${apt_args} ${_qt_packages}
+
+  sudo apt-get install ${apt_args} \
+    libgstreamer1.0-dev${suffix} \
+    libgstreamer-plugins-base1.0-dev${suffix}
   log_group
 }
