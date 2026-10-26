@@ -7,7 +7,7 @@ project(${_name} VERSION ${_version})
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
 option(ENABLE_QT "Use Qt functionality" OFF)
 
-find_package(Gio 2.76 REQUIRED)
+find_package(Gio 2.72.4 REQUIRED)
 find_package(GStreamer REQUIRED COMPONENTS video)
 find_package(JsonGlib REQUIRED)
 
