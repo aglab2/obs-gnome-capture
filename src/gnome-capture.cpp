@@ -29,40 +29,106 @@
 #include <json-glib/json-glib.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+
 typedef struct {
-	gchar connector[256];
-	gchar monitor[256];
+	std::string connector;
+	std::string monitor;
 } plug_t;
 
 typedef struct {
 	guint64 id;
-	gchar title[256];
+	std::string title;
+	std::string wm_class;
 } window_t;
 
-typedef struct {
-	GstElement *pipe;
-	gchar *session_path;
-	obs_source_t *source;
-	obs_data_t *settings;
-	uint64_t count;
-	guint subscribe_id;
-	plug_t plugs[32];
-	gint num_plugs;
-	window_t windows[256];
-	gint num_windows;
-	GThread *thread;
-	GMainLoop *loop;
-	GMutex mutex;
-	GCond cond;
-} data_t;
+struct data_t {
+	GstElement *pipe = NULL;
+	obs_source_t *source = NULL;
+	obs_data_t *settings = NULL;
+	uint64_t count = 0;
 
-static void update_plug_names(data_t *data)
+	GMainLoop *loop = NULL;
+	bool active;
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::thread thread;
+};
+
+#define SEPARATOR "\r\n"
+
+static std::string encodePlug(const plug_t& plug)
 {
+	return std::string{"M"} + plug.connector;
+}
+
+static std::string encodeWindow(const window_t& wnd)
+{
+	return std::string{"W"} + wnd.title + SEPARATOR + wnd.wm_class + SEPARATOR + std::to_string(wnd.id);
+}
+
+struct PlugDecode {
+	std::string connector;
+};
+
+struct WindowDecode {
+	std::string title;
+	std::string wm_class;
+	uint64_t id;
+};
+
+struct BadDecode{};
+
+static std::variant<BadDecode, PlugDecode, WindowDecode> decode(const std::string& val)
+{
+	if (val.empty())
+		return BadDecode{};
+
+	switch (val[0])
+	{
+		case 'M':
+			return PlugDecode{ &val[1] };
+
+		case 'W':
+			{
+				size_t loc0 = val.find(SEPARATOR);
+				if (loc0 == std::string::npos)
+					return BadDecode{};
+
+				std::string title = val.substr(1, loc0);
+
+				size_t loc1 = val.find(SEPARATOR, loc0 + 1);
+				if (loc1 == std::string::npos)
+					return BadDecode{};
+
+				std::string wm_class = val.substr(loc0 + 2, loc1 - (loc0 + 2));
+				std::string number = val.substr(loc1 + 2);
+
+				uint64_t id = strtoul(number.c_str(), nullptr, 0);
+
+				return WindowDecode{ std::move(title), std::move(wm_class), id };
+			}
+		
+		default:
+			return BadDecode{};
+
+		break;
+	}
+}
+
+static std::vector<plug_t> update_plug_names()
+{
+	std::vector<plug_t> plugs;
+
 	GError *err = NULL;
 	GVariant *display_config = NULL;
-
-	memset(data->plugs, 0, sizeof(data->plugs));
-	data->num_plugs = 0;
 
 	GDBusConnection *dbus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
 	if (err != NULL) {
@@ -97,14 +163,11 @@ static void update_plug_names(data_t *data)
 
 	while (g_variant_iter_loop(&iter, "((ssss)a(siiddada{sv})a{sv})", &connector, NULL, &monitor, NULL, NULL,
 				   NULL)) {
-		g_strlcpy(data->plugs[data->num_plugs].connector, connector,
-			  sizeof(data->plugs[data->num_plugs].connector));
-		g_strlcpy(data->plugs[data->num_plugs].monitor, monitor, sizeof(data->plugs[data->num_plugs].monitor));
+		plug_t plug;
+		plug.connector = connector;
+		plug.monitor = monitor;
 
-		data->num_plugs++;
-
-		if (data->num_plugs >= (gint)(sizeof(data->plugs) / sizeof(plug_t)))
-			break;
+		plugs.push_back(std::move(plug));
 	}
 
 	g_variant_unref(list);
@@ -115,12 +178,13 @@ fail:
 
 	if (dbus != NULL)
 		g_object_unref(dbus);
+
+	return plugs;
 }
 
-static void update_windows(data_t *data)
+static std::vector<window_t> update_windows()
 {
-	memset(data->windows, 0, sizeof(data->windows));
-	data->num_windows = 0;
+	std::vector<window_t> windows;
 
 	char path[128];
 	snprintf(path, sizeof(path), "/run/user/%d/obs_windows.json", getuid());
@@ -128,9 +192,8 @@ static void update_windows(data_t *data)
 	GError *err = NULL;
 	gchar *contents = NULL;
 	if (!g_file_get_contents(path, &contents, NULL, &err)) {
-		blog(LOG_ERROR, "Cannot read %s: %s", path, err->message);
 		g_error_free(err);
-		return;
+		return {};
 	}
 
 	JsonParser *parser = json_parser_new();
@@ -139,7 +202,7 @@ static void update_windows(data_t *data)
 		g_error_free(err);
 		g_free(contents);
 		g_object_unref(parser);
-		return;
+		return {};
 	}
 	g_free(contents);
 
@@ -148,26 +211,47 @@ static void update_windows(data_t *data)
 	if (array == NULL) {
 		blog(LOG_ERROR, "%s does not contain a JSON array", path);
 		g_object_unref(parser);
-		return;
+		return {};
 	}
 
 	gint len = json_array_get_length(array);
-	for (gint i = 0; i < len && data->num_windows < 256; i++) {
+	for (gint i = 0; i < len; i++) {
 		JsonObject *obj = json_array_get_object_element(array, i);
-		if (obj == NULL)
+		if (!obj)
 			continue;
 
-		data->windows[data->num_windows].id = json_object_get_int_member(obj, "id");
+		window_t window;
+		window.id = json_object_get_int_member(obj, "id");
+		if (const char* title = json_object_get_string_member(obj, "title"))
+			window.title = title;
+		if (const char* wm_class = json_object_get_string_member(obj, "class"))
+			window.wm_class = wm_class;
 
-		const gchar *title = json_object_get_string_member(obj, "title");
-		if (title) {
-			g_strlcpy(data->windows[data->num_windows].title, title, sizeof(data->windows[data->num_windows].title));
-		}
-
-		data->num_windows++;
+		windows.push_back(std::move(window));
 	}
 
 	g_object_unref(parser);
+
+	return windows;
+}
+
+static std::optional<uint64_t> find_window_id(const std::string& wm_class, uint64_t id)
+{
+	auto windows = update_windows();
+
+	for (const auto& wnd : windows)
+	{
+		if (wnd.id == id && wnd.wm_class == wm_class)
+			return wnd.id;
+	}
+
+	for (const auto& wnd : windows)
+	{
+		if (wnd.wm_class == wm_class)
+			return wnd.id;
+	}
+
+	return std::nullopt;
 }
 
 static const char *get_name(void * /*type_data*/)
@@ -177,7 +261,7 @@ static const char *get_name(void * /*type_data*/)
 
 static gboolean bus_callback(GstBus * /*bus*/, GstMessage *message, gpointer user_data)
 {
-	data_t *data = user_data;
+	data_t *data = (data_t*) user_data;
 
 	switch (GST_MESSAGE_TYPE(message)) {
 	case GST_MESSAGE_EOS:
@@ -201,7 +285,7 @@ static gboolean bus_callback(GstBus * /*bus*/, GstMessage *message, gpointer use
 
 static GstFlowReturn new_sample(GstAppSink *appsink, gpointer user_data)
 {
-	data_t *data = user_data;
+	data_t *data = (data_t*) user_data;
 	GstSample *sample = gst_app_sink_pull_sample(appsink);
 	GstBuffer *buffer = gst_sample_get_buffer(sample);
 	GstCaps *caps = gst_sample_get_caps(sample);
@@ -288,7 +372,7 @@ static void dbus_stream_closed_cb(GDBusConnection * /*connection*/, const gchar 
 				  const gchar * /*object_path*/, const gchar * /*interface_name*/,
 				  const gchar * /*signal_name*/, GVariant * /*parameters*/, gpointer user_data)
 {
-	data_t *data = user_data;
+	data_t *data = (data_t*) user_data;
 
 	if (data->pipe != NULL) {
 		gst_element_set_state(data->pipe, GST_STATE_NULL);
@@ -299,6 +383,12 @@ static void dbus_stream_closed_cb(GDBusConnection * /*connection*/, const gchar 
 
 		gst_object_unref(data->pipe);
 		data->pipe = NULL;
+
+		{
+			std::lock_guard<std::mutex> lck(data->mutex);
+			if (data->loop)
+				g_main_loop_quit(data->loop);
+		}
 	}
 
 	obs_source_output_video(data->source, NULL);
@@ -309,7 +399,7 @@ static void dbus_cb(GDBusConnection * /*connection*/, const gchar * /*sender_nam
 		    gpointer user_data)
 {
 	GError *err = NULL;
-	data_t *data = user_data;
+	data_t *data = (data_t*) user_data;
 	guint node_id = 0;
 
 	g_variant_get(parameters, "(u)", &node_id, NULL);
@@ -341,23 +431,26 @@ static void dbus_cb(GDBusConnection * /*connection*/, const gchar * /*sender_nam
 	gst_element_set_state(data->pipe, GST_STATE_PLAYING);
 }
 
-static gboolean loop_startup(gpointer user_data)
+static bool await_exit(data_t* data)
 {
-	data_t *data = user_data;
+	std::unique_lock<std::mutex> lck(data->mutex);
+	if (!data->active)
+		return false;
 
-	g_mutex_lock(&data->mutex);
-	g_cond_signal(&data->cond);
-	g_mutex_unlock(&data->mutex);
-
-	return FALSE;
+	data->cv.wait_for(lck, std::chrono::seconds(2));
+	return data->active;
 }
 
-static void *_start(void *p)
+static void _start(data_t* data)
 {
-	data_t *data = p;
+retry:
 	GError *err = NULL;
 	GVariant *stream_res = NULL;
 	GVariant *session_res = NULL;
+	std::optional<guint> subscribe_id;
+	const char* src;
+	GstBus *bus;
+	std::string a_session_path;
 
 	data->count = 0;
 
@@ -368,9 +461,9 @@ static void *_start(void *p)
 	GDBusConnection *dbus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
 	if (err != NULL) {
 		blog(LOG_ERROR, "Cannot connect to DBus: %s", err->message);
-		g_error_free(err);
+		g_error_free(err); err = NULL;
 
-		goto fail;
+		goto fail2;
 	}
 
 	session_res = g_dbus_connection_call_sync(dbus, "org.gnome.Mutter.ScreenCast", "/org/gnome/Mutter/ScreenCast",
@@ -380,7 +473,7 @@ static void *_start(void *p)
 
 	if (err != NULL) {
 		blog(LOG_ERROR, "Cannot call CreateSession() on DBus: %s", err->message);
-		g_error_free(err);
+		g_error_free(err); err = NULL;
 
 		goto fail;
 	}
@@ -388,39 +481,59 @@ static void *_start(void *p)
 	gchar *session_path;
 	g_variant_get(session_res, "(o)", &session_path, NULL);
 
-	data->session_path = g_strdup(session_path);
+	a_session_path = g_strdup(session_path);
 
-	guint64 window_id = obs_data_get_int(data->settings, "window");
+	do
+	{
+		src = obs_data_get_string(data->settings, "source");
+		if (!src) {
+			continue;
+		}
 
-	if (window_id == 0) {
-		stream_res = g_dbus_connection_call_sync(
-			dbus, "org.gnome.Mutter.ScreenCast", session_path, "org.gnome.Mutter.ScreenCast.Session",
-			"RecordMonitor",
-			g_variant_new_parsed("(%s, {'cursor-mode' : <%u>})",
-					     obs_data_get_string(data->settings, "connector"),
-					     obs_data_get_bool(data->settings, "cursor") ? 1 : 0),
-			NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
-	} else {
-		stream_res = g_dbus_connection_call_sync(
-			dbus, "org.gnome.Mutter.ScreenCast", session_path, "org.gnome.Mutter.ScreenCast.Session",
-			"RecordWindow",
-			g_variant_new_parsed("({'window-id' : <%t>, 'cursor-mode' : <%u>},)", window_id,
-					     obs_data_get_bool(data->settings, "cursor") ? 1 : 0),
-			NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
-	}
+		{
+			auto decodedWnd = decode(src);
+			if (auto plug = std::get_if<PlugDecode>(&decodedWnd)) {
+				stream_res = g_dbus_connection_call_sync(
+					dbus, "org.gnome.Mutter.ScreenCast", session_path, "org.gnome.Mutter.ScreenCast.Session",
+					"RecordMonitor",
+					g_variant_new_parsed("(%s, {'cursor-mode' : <%u>})",
+								plug->connector.c_str(),
+								obs_data_get_bool(data->settings, "cursor") ? 1 : 0),
+					NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
+			} else if (auto wnd = std::get_if<WindowDecode>(&decodedWnd)) {
+				std::optional<uint64_t> window_id = find_window_id(wnd->wm_class, wnd->id);
+				if (!window_id)
+					continue;
 
-	if (err != NULL) {
-		blog(LOG_ERROR, "Cannot call %s on DBus: %s", window_id == 0 ? "RecordMonitor()" : "RecordWindow()",
-		     err->message);
-		g_error_free(err);
+				stream_res = g_dbus_connection_call_sync(
+					dbus, "org.gnome.Mutter.ScreenCast", session_path, "org.gnome.Mutter.ScreenCast.Session",
+					"RecordWindow",
+					g_variant_new_parsed("({'window-id' : <%t>, 'cursor-mode' : <%u>},)", *window_id,
+								obs_data_get_bool(data->settings, "cursor") ? 1 : 0),
+					NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
+			} else {
+				continue;
+			}
+		}
 
-		goto fail;
+		if (err != NULL) {
+			g_error_free(err); err = NULL;
+			continue;
+		} else {
+			break;
+		}
+	} while(await_exit(data));
+
+	{
+		std::lock_guard<std::mutex> lck(data->mutex);
+		if (!data->active)
+			goto fail;
 	}
 
 	gchar *stream_path;
 	g_variant_get(stream_res, "(o)", &stream_path, NULL);
 
-	data->subscribe_id = g_dbus_connection_signal_subscribe(dbus, NULL, NULL, "Closed", session_path, NULL,
+	subscribe_id = g_dbus_connection_signal_subscribe(dbus, NULL, NULL, "Closed", session_path, NULL,
 								(GDBusSignalFlags)G_DBUS_CALL_FLAGS_NONE,
 								dbus_stream_closed_cb, data, NULL);
 
@@ -433,7 +546,7 @@ static void *_start(void *p)
 
 	if (err != NULL) {
 		blog(LOG_ERROR, "Cannot call Start() on DBus: %s", err->message);
-		g_error_free(err);
+		g_error_free(err); err = NULL;
 
 		goto fail;
 	}
@@ -448,11 +561,13 @@ fail:
 	if (dbus != NULL)
 		g_object_unref(dbus);
 
-	GSource *source = g_idle_source_new();
-	g_source_set_callback(source, loop_startup, data, NULL);
-	g_source_attach(source, context);
-
-	data->loop = g_main_loop_new(context, FALSE);
+	{
+		std::lock_guard<std::mutex> lck(data->mutex);
+		if (!data->active)
+			goto fail2;
+		
+		data->loop = g_main_loop_new(context, FALSE);
+	}
 
 	g_main_loop_run(data->loop);
 
@@ -461,7 +576,7 @@ fail:
 
 	gst_element_set_state(data->pipe, GST_STATE_NULL);
 
-	GstBus *bus = gst_element_get_bus(data->pipe);
+	bus = gst_element_get_bus(data->pipe);
 	gst_bus_remove_watch(bus);
 	gst_object_unref(bus);
 
@@ -471,73 +586,78 @@ fail:
 	dbus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
 	if (err != NULL) {
 		blog(LOG_ERROR, "Cannot connect to DBus: %s", err->message);
-		g_error_free(err);
-
-		goto fail2;
-	}
-
-	g_dbus_connection_signal_unsubscribe(dbus, data->subscribe_id);
-	data->subscribe_id = 0;
-
-	g_dbus_connection_call_sync(dbus, "org.gnome.Mutter.ScreenCast", data->session_path,
-				    "org.gnome.Mutter.ScreenCast.Session", "Stop", NULL, NULL, G_DBUS_CALL_FLAGS_NONE,
-				    -1, NULL, &err);
-
-	if (err != NULL) {
-		blog(LOG_ERROR, "Cannot call Stop() on DBus: %s", err->message);
-		g_error_free(err);
+		g_error_free(err); err = NULL;
 
 		goto fail2;
 	}
 
 fail2:
-	g_free(data->session_path);
-	data->session_path = NULL;
+	if (subscribe_id)
+	{
+		g_dbus_connection_signal_unsubscribe(dbus, *subscribe_id);
+		g_dbus_connection_call_sync(dbus, "org.gnome.Mutter.ScreenCast", a_session_path.c_str(),
+						"org.gnome.Mutter.ScreenCast.Session", "Stop", NULL, NULL, G_DBUS_CALL_FLAGS_NONE,
+						-1, NULL, &err);
+
+		if (err != NULL) {
+			blog(LOG_ERROR, "Cannot call Stop() on DBus: %s", err->message);
+			g_error_free(err); err = NULL;
+			err = NULL;
+		}
+	}
 
 	if (dbus != NULL)
 		g_object_unref(dbus);
 
-	g_main_loop_unref(data->loop);
-	data->loop = NULL;
+	{
+		std::lock_guard<std::mutex> lck(data->mutex);
+		g_main_loop_unref(data->loop);
+		data->loop = NULL;		
+	}
 
 	g_main_context_unref(context);
 
-	return NULL;
+	{
+		std::lock_guard<std::mutex> lck(data->mutex);
+		if (!data->active)
+			return;
+	}
+
+	goto retry;
 }
 
 static void *create(obs_data_t *settings, obs_source_t *source)
 {
-	data_t *data = g_new0(data_t, 1);
+	data_t *data = new data_t;
 
 	data->source = source;
 	data->settings = settings;
-
-	g_mutex_init(&data->mutex);
-	g_cond_init(&data->cond);
 
 	return data;
 }
 
 static void start(data_t *data)
 {
-	g_mutex_lock(&data->mutex);
-
-	data->thread = g_thread_new("OBS GNOME screen cast", _start, data);
-
-	g_cond_wait(&data->cond, &data->mutex);
-	g_mutex_unlock(&data->mutex);
+	data->active = true;
+	data->thread = std::thread{ _start, data };
 }
 
 static void stop(data_t *data)
 {
-	if (data->thread == NULL) {
+	if (!data->thread.joinable()) {
 		return;
 	}
 
-	g_main_loop_quit(data->loop);
+	{
+		std::lock_guard<std::mutex> lck(data->mutex);
+		if (data->loop)
+			g_main_loop_quit(data->loop);
+		
+		data->active = false;
+		data->cv.notify_one();
+	}
 
-	g_thread_join(data->thread);
-	data->thread = NULL;
+	data->thread.join();
 
 	obs_source_output_video(data->source, NULL);
 }
@@ -548,41 +668,33 @@ static void destroy(void *p)
 
 	stop(data);
 
-	g_mutex_clear(&data->mutex);
-	g_cond_clear(&data->cond);
-
-	g_free(data);
+	delete data;
 }
 
 static void get_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_string(settings, "connector", "");
-	obs_data_set_default_int(settings, "window", 0);
+	obs_data_set_default_string(settings, "source", "");
 	obs_data_set_default_bool(settings, "cursor", true);
 	obs_data_set_default_bool(settings, "timestamps", false);
 }
 
-static obs_properties_t *get_properties(void *p)
+static obs_properties_t *get_properties(void *)
 {
-	data_t *data = (data_t *)p;
-
 	obs_properties_t *props = obs_properties_create();
-	obs_property_t *prop =
-		obs_properties_add_list(props, "connector", "Connector", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_t *prop = obs_properties_add_list(props, "source", "Source", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 
-	update_plug_names(data);
-	for (gint i = 0; i < data->num_plugs; i++) {
-		gchar *tmp = g_strdup_printf("%s (%s)", data->plugs[i].monitor, data->plugs[i].connector);
-		obs_property_list_add_string(prop, tmp, data->plugs[i].connector);
-		g_free(tmp);
+	auto plugs = update_plug_names();
+	obs_property_list_add_string(prop, "", "");
+	for (const auto& plug : plugs)
+	{
+		obs_property_list_add_string(prop, plug.monitor.c_str(), encodePlug(plug).c_str());
 	}
 
-	prop = obs_properties_add_list(props, "window", "Window", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(prop, "- Desktop capture -", 0);
-
-	update_windows(data);
-	for (gint i = 0; i < data->num_windows; i++)
-		obs_property_list_add_int(prop, data->windows[i].title, data->windows[i].id);
+	auto windows = update_windows();
+	for (const auto& wnd : windows)
+	{
+		obs_property_list_add_string(prop, wnd.title.c_str(), encodeWindow(wnd).c_str());
+	}
 
 	obs_properties_add_bool(props, "cursor", "Draw mouse cursor");
 	obs_properties_add_bool(props, "timestamps", "Use running time as time stamps");
@@ -590,24 +702,28 @@ static obs_properties_t *get_properties(void *p)
 	return props;
 }
 
-static void update(void *data, obs_data_t * /*settings*/)
+static void update(void *p, obs_data_t * /*settings*/)
 {
-	if (((data_t *)data)->session_path == NULL) {
-		return;
+	data_t* data = (data_t*) p;
+	{
+		std::lock_guard<std::mutex> lck(data->mutex);
+		if (!data->loop)
+			return;
 	}
 
+	// mind that we can technically race with data->loop being destroyed, in this case it is just a noop
 	stop(data);
 	start(data);
 }
 
 static void show(void *data)
 {
-	start(data);
+	start((data_t*) data);
 }
 
 static void hide(void *data)
 {
-	stop(data);
+	stop((data_t*) data);
 }
 
 void gnome_capture_init()

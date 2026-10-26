@@ -38,7 +38,7 @@ if(ENABLE_QT)
                AUTORCC ON)
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/gnome-capture.c)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/gnome-capture.cpp)
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${GSTREAMER_INCLUDE_DIRS} ${JSON_GLIB_INCLUDE_DIRS})
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
