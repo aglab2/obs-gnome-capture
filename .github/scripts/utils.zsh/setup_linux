@@ -62,7 +62,7 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
 
   sudo apt-get install ${apt_args} ${_qt_packages}
 
-  sudo apt-get remove libunwind-dev
+  sudo apt-get remove libunwind-\*
 
   sudo apt-get install ${apt_args} \
     libgstreamer1.0-dev${suffix} \
