@@ -27,6 +27,7 @@
 #include <gst/app/app.h>
 #include <gst/video/video.h>
 #include <json-glib/json-glib.h>
+#include <unistd.h>
 
 typedef struct {
 	gchar connector[256];
@@ -118,59 +119,55 @@ fail:
 
 static void update_windows(data_t *data)
 {
-	GError *err = NULL;
-
-	GVariant *stream_res = NULL;
-	GVariant *session_res = NULL;
-
 	memset(data->windows, 0, sizeof(data->windows));
 	data->num_windows = 0;
 
-	GDBusConnection *dbus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &err);
-	if (err != NULL) {
-		blog(LOG_ERROR, "Cannot connect to DBus: %s", err->message);
-		g_error_free(err);
+	char path[128];
+	snprintf(path, sizeof(path), "/run/user/%d/obs_windows.json", getuid());
 
-		goto fail;
+	GError *err = NULL;
+	gchar *contents = NULL;
+	if (!g_file_get_contents(path, &contents, NULL, &err)) {
+		blog(LOG_ERROR, "Cannot read %s: %s", path, err->message);
+		g_error_free(err);
+		return;
 	}
 
-	session_res = g_dbus_connection_call_sync(dbus, "org.gnome.Mutter.ScreenCast", "/org/gnome/Mutter/ScreenCast",
-						  "org.gnome.Mutter.ScreenCast", "CreateSession",
-						  g_variant_new_parsed("({'dummy' : <0>},)"), NULL,
-						  G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
-
-	if (err != NULL) {
-		blog(LOG_ERROR, "Cannot call CreateSession() on DBus: %s", err->message);
+	JsonParser *parser = json_parser_new();
+	if (!json_parser_load_from_data(parser, contents, -1, &err)) {
+		blog(LOG_ERROR, "Cannot parse %s: %s", path, err->message);
 		g_error_free(err);
+		g_free(contents);
+		g_object_unref(parser);
+		return;
+	}
+	g_free(contents);
 
-		goto fail;
+	JsonNode *root = json_parser_get_root(parser);
+	JsonArray *array = json_node_get_array(root);
+	if (array == NULL) {
+		blog(LOG_ERROR, "%s does not contain a JSON array", path);
+		g_object_unref(parser);
+		return;
 	}
 
-	gchar *session_path;
-	g_variant_get(session_res, "(o)", &session_path, NULL);
+	gint len = json_array_get_length(array);
+	for (gint i = 0; i < len && data->num_windows < 256; i++) {
+		JsonObject *obj = json_array_get_object_element(array, i);
+		if (obj == NULL)
+			continue;
 
-	stream_res = g_dbus_connection_call_sync(
-		dbus, "org.gnome.Mutter.ScreenCast", session_path, "org.gnome.Mutter.ScreenCast.Session",
-		"RecordWindow",
-		g_variant_new_parsed("({'window-id' : <%t>, 'cursor-mode' : <%u>},)", 0, 0),
-		NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
-	
-	// expected to fail but refreshes the list
+		data->windows[data->num_windows].id = json_object_get_int_member(obj, "id");
 
-	if (err != NULL) {
-		blog(LOG_ERROR, "expected error: %s", err->message);
-		g_error_free(err);
+		const gchar *title = json_object_get_string_member(obj, "title");
+		if (title) {
+			g_strlcpy(data->windows[data->num_windows].title, title, sizeof(data->windows[data->num_windows].title));
+		}
+
+		data->num_windows++;
 	}
 
-fail:
-	if (session_res != NULL)
-		g_variant_unref(session_res);
-
-	if (stream_res != NULL)
-		g_variant_unref(stream_res);
-
-	if (dbus != NULL)
-		g_object_unref(dbus);
+	g_object_unref(parser);
 }
 
 static const char *get_name(void * /*type_data*/)
