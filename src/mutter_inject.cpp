@@ -261,14 +261,27 @@ public:
 
 private:
     std::ifstream file_;
-    std::string filter_;
+    std::string prefix_;
+    bool hasDigitsCheck_ = false;
+    std::string suffix_;
     ProcfsMapEntry entry_;
     std::string line_;
 };
 
 ProcfsMapIter::ProcfsMapIter(pid_t pid, std::string filter)
-: filter_(std::move(filter))
 {
+    size_t digitsLoc = filter.find("DIGITS");
+    if (std::string::npos != digitsLoc)
+    {
+        prefix_ = filter.substr(0, digitsLoc);
+        hasDigitsCheck_ = true;
+        suffix_ = filter.substr(digitsLoc + sizeof("DIGITS") - 1);
+    }
+    else
+    {
+        prefix_ = filter;
+    }
+
     char line[100];
     sprintf(line, "/proc/%d/maps", pid);
 
@@ -294,8 +307,20 @@ struct ProcfsMapEntry* ProcfsMapIter::next()
 {
     while (std::getline(file_, line_))
     {
-        if (std::string::npos == line_.find(filter_))
+        size_t loc = line_.find(prefix_);
+        if (std::string::npos == loc)
             continue;
+        
+        if (hasDigitsCheck_)
+        {
+            loc += prefix_.length();
+            while ('0' <= line_[loc] && line_[loc] <= '9') loc++;
+
+            if (0 != memcmp(line_.data() + loc, suffix_.data(), suffix_.length()))
+            {
+                continue;
+            }
+        }
 
         const char* dash = sstrchr(line_, '-');
         if (!dash)
@@ -630,19 +655,10 @@ static CodePiece toCodePiece(const DecompilePiece& dp)
 }
 
 // MARK: Decompiling
-static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
+static void decompile(uint64_t fn, int amount, struct DecompileResult& result)
 {
-    struct DecompileResult result{};
-    result.count = 0;
-
-    if (amount > 64)
-        return result;
-
-    uint8_t *code = result.code.data();
-    if (!ram.pread(result.code.size(), fn, code))
-        return result;
-
-    const uint8_t* p = (const uint8_t*) code;
+    const uint8_t* code = result.code.data();
+    const uint8_t* p = code;
     const uint8_t* end = p + result.code.size();
 
     if (code[0] == 0xf3 && code[1] == 0x0f && code[2] == 0x1e && code[3] == 0xfa)
@@ -713,7 +729,7 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
             else
             {
                 log("unknown opcode: 0f %02x???\n", opcode);
-                return result;
+                return;
             }
         }
         else if (0x50 <= opcode && opcode <= 0x57)
@@ -797,7 +813,7 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
         else
         {
             log("unknown opcode: %02x???\n", opcode);
-            return result;
+            return;
         }
 
         if (want_modrm)
@@ -814,7 +830,7 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
 
             if (want_group)
             {
-                if (mod != 0 || reg != 3 || rm != 5)
+                if (mod != 0 || reg != 2 || rm != 5)
                 {
                     log("unkn group\n");
                 }
@@ -872,6 +888,20 @@ static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
             break;
         }
     }
+}
+
+static struct DecompileResult decompile(UnixFile& ram, uint64_t fn, int amount)
+{
+    struct DecompileResult result{};
+
+    if (amount > 64)
+        return result;
+
+    uint8_t *code = result.code.data();
+    if (!ram.pread(result.code.size(), fn, code))
+        return result;
+
+    decompile(fn, amount, result);
 
     return result;
 }
@@ -921,7 +951,7 @@ static struct LibcRecon reconLibc(UnixFile& ram, int pid)
 
 static uint64_t findListWindowsInMutter(UnixFile& ram, int pid)
 {
-	auto ret = findFunction(pid, ram, "libmutter-18.so", { "meta_display_list_windows" });
+	auto ret = findFunction(pid, ram, "libmutter-DIGITS.so", { "meta_display_list_windows" });
     if (ret.size() != 1)
         return 0;
 
@@ -949,6 +979,29 @@ static std::vector<pid_t> searchProcess()
 	closedir(dir);
 
 	return result;
+}
+
+static uint64_t findIsraCopy(UnixFile& ram, uint64_t fn, uint64_t expectedCall, int amount, DecompileResult& res)
+{
+    std::vector<uint8_t> scanBuf;
+    scanBuf.resize(4096);
+    if (!ram.pread(scanBuf.size(), fn, scanBuf.data()))
+        return 0;
+
+    uint8_t* buf = (uint8_t*) memmem(scanBuf.data() + 1, scanBuf.size() - 1, scanBuf.data(), 8);
+    if (!buf)
+        return 0;
+
+    size_t off = buf - scanBuf.data();
+    res = {};
+    memcpy(res.code.data(), buf, std::min(res.code.size(), 4096 - off));
+
+    decompile(fn + off, amount, res);
+
+    if (res.callingTo != expectedCall)
+        return 0;
+    
+    return fn + off;
 }
 
 // MARK: Detours
@@ -1042,13 +1095,13 @@ int main()
         writeJmpViaRIP(patchCodeWithCall.data() + decResult.shift + decResult.count
                      , rxPage                   + decResult.shift + decResult.count
                      , rxPage + 0xf00);
-        if (!ptraceWriteBytes(pid, rxPage, patchCodeWithCall.data(), patchCodeWithCall.size(), 1 /*rx*/))
+        if (!ptraceWriteBytes(pid, rxPage + 0x000, patchCodeWithCall.data(), patchCodeWithCall.size(), 1 /*rx*/))
         {
             log("   Failed to write to rx page\n");
         }
 
         // 0x100
-        uint8_t content[128] = {
+        static const uint8_t content[128] = {
             0x55,                                  // push rbp
             0x48, 0x89, 0xe5,                      // mov rbp, rsp
             0x48, 0x8b, 0x0d, 0x0d,0x0e,0x00,0x00, // mov rcx, [rip+disp32] <- rwPage at 0xf18
@@ -1083,12 +1136,60 @@ int main()
 
         // oftentimes gcc will decide to emit an isra copy of meta_display_list_windows with META_LIST_DEFAULT inlined
         // try to guess that it exists by looking at first few bytes of the function and doing an educated guess...
+        DecompileResult decResultIsra;
+        uint64_t listWindowAddrIsra = findIsraCopy(ram, listWindowAddr, decResult.callingTo, 13, decResultIsra);
 
-        uint64_t supplPointers[4];
-        supplPointers[0] = listWindowAddr + decResult.shift + decResult.count;
-        supplPointers[1] = libcRecon.dlopen;
-        supplPointers[2] = libcRecon.dlsym;
-        supplPointers[3] = rwPage;
+        // 0x200
+        CodePiece patchCodeWithCallIsra = toCodePiece(decResultIsra.code);
+        writeJmpViaRIP(patchCodeWithCallIsra.data() + decResultIsra.shift + decResultIsra.count
+                     , rxPage + 0x200               + decResultIsra.shift + decResultIsra.count
+                     , rxPage + 0xf20);
+        if (!ptraceWriteBytes(pid, rxPage + 0x200, patchCodeWithCallIsra.data(), patchCodeWithCallIsra.size(), 1 /*rx*/))
+        {
+            log("   Failed to write to rx page\n");
+        }
+
+        // 0x300
+        static const uint8_t contentIsra[128] = {
+            0x55,                                  // push rbp
+            0x48, 0x89, 0xe5,                      // mov rbp, rsp
+            0x48, 0x8b, 0x0d, 0x0d,0x0c,0x00,0x00, // mov rcx, [rip+disp32] <- rwPage at 0xf18
+            0x48, 0x8b, 0x01,                      // mov rax, [rcx]
+            0x48, 0x85, 0xc0,                      // test rax, rax
+            0x0f, 0x85, 0x32,0x00,0x00,0x00,       // jne <- lea rdx at 0x49
+
+            0x57,                                  // push rdi
+            0x56,                                  // push rsi
+            0x48, 0x8d, 0x3d, 0xe0,0x0a,0x00,0x00, // lea rdi, [rip+disp32] <- filename at 0xe00
+            0x48, 0xc7, 0xc6, 1,0,0,0,             // mov rsi,1
+            0xff, 0x15, 0xdb,0x0b,0x00,0x00,       // call [rip+disp32]    <- dlopen at 0xf08
+            0x48, 0x89, 0xc7,                      // mov rdi,rax
+            0x48, 0x8d, 0x35, 0xc9,0x09,0x00,0x00, // lea rsi, [rip+disp32] <- symname at 0xd00
+            0xff, 0x15, 0xd3,0x0b,0x00,0x00,       // call [rip+disp32]    <- dlsym at 0xf10
+            0x48, 0x8b, 0x0d, 0xd4,0x0b,0x00,0x00, // mov rcx, [rip+disp32] <- rwPage at 0xf18
+            0x48, 0x89, 0x01,                      // mov [rcx], rax
+            0x5e,                                  // pop rsi
+            0x5f,                                  // pop rdi
+
+            // rax jne here
+            0x48, 0x8d, 0x15, 0xb0,0xfe,0xff,0xff, // lea rdx, [rip+disp32] <- orig fn at 0x200
+            0xff, 0xd0,                            // call rax
+            0x5d,                                  // pop rbp
+            0xc3,                                  // ret
+        };
+
+        if (!ptraceWriteBytes(pid, rxPage + 0x300, contentIsra, sizeof(contentIsra), 1 /*rx*/))
+        {
+            log("   Failed to write to rx page\n");
+        }
+
+        uint64_t supplPointers[] = {
+            listWindowAddr + decResult.shift + decResult.count,
+            libcRecon.dlopen,
+            libcRecon.dlsym,
+            rwPage,
+            listWindowAddrIsra + decResult.shift + decResult.count,
+        };
         if (!ptraceWriteBytes(pid, rxPage + 0xf00, supplPointers, sizeof(supplPointers), 1 /*rx*/))
         {
             log("   Failed to write to rx page supplementary pointers\n");
@@ -1107,12 +1208,25 @@ int main()
         }
 
         // write detour to rx page
-        ptraced.moveThreadsOutOfRedzone(listWindowAddr + decResult.shift, listWindowAddr + decResult.shift + decResult.count);
-        CodePiece mutterCodeWithHook = toCodePiece(decResult.code);
-        writeJmpViaRAX(mutterCodeWithHook.data() + decResult.shift, rxPage + 0x100);
-        if (!ptraceWriteBytes(pid, listWindowAddr, mutterCodeWithHook.data(), mutterCodeWithHook.size(), 1 /*rx*/))
         {
-            log("   Failed to write detour\n");
+            ptraced.moveThreadsOutOfRedzone(listWindowAddr + decResult.shift, listWindowAddr + decResult.shift + decResult.count);
+            CodePiece mutterCodeWithHook = toCodePiece(decResult.code);
+            writeJmpViaRAX(mutterCodeWithHook.data() + decResult.shift, rxPage + 0x100);
+            if (!ptraceWriteBytes(pid, listWindowAddr, mutterCodeWithHook.data(), mutterCodeWithHook.size(), 1 /*rx*/))
+            {
+                log("   Failed to write detour\n");
+            }
+        }
+
+        if (listWindowAddrIsra)
+        {
+            ptraced.moveThreadsOutOfRedzone(listWindowAddrIsra + decResultIsra.shift, listWindowAddrIsra + decResultIsra.shift + decResultIsra.count);
+            CodePiece mutterCodeWithHook = toCodePiece(decResultIsra.code);
+            writeJmpViaRAX(mutterCodeWithHook.data() + decResultIsra.shift, rxPage + 0x300);
+            if (!ptraceWriteBytes(pid, listWindowAddrIsra, mutterCodeWithHook.data(), mutterCodeWithHook.size(), 1 /*rx*/))
+            {
+                log("   Failed to write detour for isra\n");
+            }
         }
 	}
 
