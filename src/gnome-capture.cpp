@@ -329,7 +329,7 @@ static GstFlowReturn new_sample(GstAppSink *appsink, gpointer user_data)
 	frame.linesize[0] = video_info.stride[0];
 	frame.data[0] = info.data + video_info.offset[0];
 
-    // GstClockTime pts = GST_BUFFER_PTS(buffer);
+	// GstClockTime pts = GST_BUFFER_PTS(buffer);
 	frame.timestamp = os_gettime_ns(); // GST_CLOCK_TIME_IS_VALID(pts) ? os_gettime_ns() : pts;
 
 	if (meta != NULL) {
@@ -517,8 +517,7 @@ retry:
 					dbus, "org.gnome.Mutter.ScreenCast", session_path,
 					"org.gnome.Mutter.ScreenCast.Session", "RecordWindow",
 					g_variant_new_parsed("({'window-id' : <%t>, 'cursor-mode' : <%u>},)",
-							     *window_id,
-							     config->mouse),
+							     *window_id, config->mouse),
 					NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
 			} else {
 				continue;
@@ -721,10 +720,10 @@ static void update(void *p, obs_data_t * /*settings*/)
 {
 	data_t *data = (data_t *)p;
 
-	const char* src = obs_data_get_string(data->settings, "source");
+	const char *src = obs_data_get_string(data->settings, "source");
 	bool mouse = obs_data_get_bool(data->settings, "cursor");
 
-	auto cfg = std::make_shared<Config>(Config{ src, mouse });
+	auto cfg = std::make_shared<Config>(Config{src, mouse});
 
 	{
 		std::lock_guard<std::mutex> lck(data->mutex);
@@ -741,12 +740,12 @@ static void update(void *p, obs_data_t * /*settings*/)
 
 static void show(void *p)
 {
-	data_t *data = (data_t*) p;
+	data_t *data = (data_t *)p;
 
-	const char* src = obs_data_get_string(data->settings, "source");
+	const char *src = obs_data_get_string(data->settings, "source");
 	bool mouse = obs_data_get_bool(data->settings, "cursor");
 
-	auto cfg = std::make_shared<Config>(Config{ src, mouse });
+	auto cfg = std::make_shared<Config>(Config{src, mouse});
 	data->config = std::move(cfg);
 
 	start(data);
