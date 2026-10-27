@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <stdbool.h>
@@ -122,7 +124,8 @@ static void dump_windows(GSList* windows)
 
     int fd = open(path_tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
-        write(fd, s->str, s->len);
+        ssize_t written = write(fd, s->str, s->len);
+        (void)written;
         close(fd);
         rename(path_tmp, path_out);
     }
