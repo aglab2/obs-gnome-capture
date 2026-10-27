@@ -49,6 +49,11 @@ typedef struct {
 	std::string wm_class;
 } window_t;
 
+struct Config {
+	std::string encoding;
+	bool mouse;
+};
+
 struct data_t {
 	GstElement *pipe = NULL;
 	obs_source_t *source = NULL;
@@ -60,6 +65,9 @@ struct data_t {
 	std::mutex mutex;
 	std::condition_variable cv;
 	std::thread thread;
+
+	// TODO: Probably unique_ptr is sufficient
+	std::shared_ptr<Config> config;
 };
 
 #define SEPARATOR "\r\n"
@@ -321,7 +329,8 @@ static GstFlowReturn new_sample(GstAppSink *appsink, gpointer user_data)
 	frame.linesize[0] = video_info.stride[0];
 	frame.data[0] = info.data + video_info.offset[0];
 
-	frame.timestamp = obs_data_get_bool(data->settings, "timestamps") ? os_gettime_ns() : data->count++;
+    // GstClockTime pts = GST_BUFFER_PTS(buffer);
+	frame.timestamp = os_gettime_ns(); // GST_CLOCK_TIME_IS_VALID(pts) ? os_gettime_ns() : pts;
 
 	if (meta != NULL) {
 		frame.width = meta->width;
@@ -444,9 +453,9 @@ retry:
 	GVariant *stream_res = NULL;
 	GVariant *session_res = NULL;
 	std::optional<guint> subscribe_id;
-	const char *src;
 	GstBus *bus;
 	std::string a_session_path;
+	std::shared_ptr<Config> config;
 
 	data->count = 0;
 
@@ -482,19 +491,22 @@ retry:
 	a_session_path = g_strdup(session_path);
 
 	do {
-		src = obs_data_get_string(data->settings, "source");
-		if (!src) {
-			continue;
+		{
+			std::lock_guard<std::mutex> lck(data->mutex);
+			config = data->config;
 		}
 
+		if (!config)
+			continue;
+
 		{
-			auto decodedWnd = decode(src);
+			auto decodedWnd = decode(config->encoding);
 			if (auto plug = std::get_if<PlugDecode>(&decodedWnd)) {
 				stream_res = g_dbus_connection_call_sync(
 					dbus, "org.gnome.Mutter.ScreenCast", session_path,
 					"org.gnome.Mutter.ScreenCast.Session", "RecordMonitor",
 					g_variant_new_parsed("(%s, {'cursor-mode' : <%u>})", plug->connector.c_str(),
-							     obs_data_get_bool(data->settings, "cursor") ? 1 : 0),
+							     config->mouse),
 					NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
 			} else if (auto wnd = std::get_if<WindowDecode>(&decodedWnd)) {
 				std::optional<uint64_t> window_id = find_window_id(wnd->wm_class, wnd->id);
@@ -506,7 +518,7 @@ retry:
 					"org.gnome.Mutter.ScreenCast.Session", "RecordWindow",
 					g_variant_new_parsed("({'window-id' : <%t>, 'cursor-mode' : <%u>},)",
 							     *window_id,
-							     obs_data_get_bool(data->settings, "cursor") ? 1 : 0),
+							     config->mouse),
 					NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &err);
 			} else {
 				continue;
@@ -525,6 +537,8 @@ retry:
 	{
 		std::lock_guard<std::mutex> lck(data->mutex);
 		if (!data->active)
+			goto fail;
+		if (data->config != config)
 			goto fail;
 	}
 
@@ -563,6 +577,8 @@ fail:
 	{
 		std::lock_guard<std::mutex> lck(data->mutex);
 		if (!data->active)
+			goto fail2;
+		if (data->config != config)
 			goto fail2;
 
 		data->loop = g_main_loop_new(context, FALSE);
@@ -675,7 +691,7 @@ static void get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "source", "");
 	obs_data_set_default_bool(settings, "cursor", true);
-	obs_data_set_default_bool(settings, "timestamps", false);
+	// obs_data_set_default_bool(settings, "timestamps", false);
 }
 
 static obs_properties_t *get_properties(void *)
@@ -696,7 +712,7 @@ static obs_properties_t *get_properties(void *)
 	}
 
 	obs_properties_add_bool(props, "cursor", "Draw mouse cursor");
-	obs_properties_add_bool(props, "timestamps", "Use running time as time stamps");
+	// obs_properties_add_bool(props, "timestamps", "Use running time as time stamps");
 
 	return props;
 }
@@ -704,20 +720,36 @@ static obs_properties_t *get_properties(void *)
 static void update(void *p, obs_data_t * /*settings*/)
 {
 	data_t *data = (data_t *)p;
+
+	const char* src = obs_data_get_string(data->settings, "source");
+	bool mouse = obs_data_get_bool(data->settings, "cursor");
+
+	auto cfg = std::make_shared<Config>(Config{ src, mouse });
+
 	{
 		std::lock_guard<std::mutex> lck(data->mutex);
-		if (!data->loop)
-			return;
-	}
+		// if data->loop did not exist yet/no longer exist, nothing needs to be done because we are scanning?
+		// this will trigger a rescan
+		if (data->loop)
+			g_main_loop_quit(data->loop);
+		else
+			data->cv.notify_one();
 
-	// mind that we can technically race with data->loop being destroyed, in this case it is just a noop
-	stop(data);
-	start(data);
+		data->config = std::move(cfg);
+	}
 }
 
-static void show(void *data)
+static void show(void *p)
 {
-	start((data_t *)data);
+	data_t *data = (data_t*) p;
+
+	const char* src = obs_data_get_string(data->settings, "source");
+	bool mouse = obs_data_get_bool(data->settings, "cursor");
+
+	auto cfg = std::make_shared<Config>(Config{ src, mouse });
+	data->config = std::move(cfg);
+
+	start(data);
 }
 
 static void hide(void *data)
