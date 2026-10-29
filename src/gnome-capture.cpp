@@ -607,7 +607,7 @@ fail:
 	}
 
 fail2:
-	if (subscribe_id) {
+	if (dbus && subscribe_id) {
 		g_dbus_connection_signal_unsubscribe(dbus, *subscribe_id);
 		g_dbus_connection_call_sync(dbus, "org.gnome.Mutter.ScreenCast", a_session_path.c_str(),
 					    "org.gnome.Mutter.ScreenCast.Session", "Stop", NULL, NULL,
@@ -619,10 +619,14 @@ fail2:
 			err = NULL;
 			err = NULL;
 		}
+		subscribe_id.reset();
 	}
 
 	if (dbus != NULL)
+	{
 		g_object_unref(dbus);
+		dbus = NULL;
+	}
 
 	{
 		std::lock_guard<std::mutex> lck(data->mutex);
