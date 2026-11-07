@@ -1,0 +1,10 @@
+[Unit]
+Description=OBS GNOME Capture - Mutter Process Injector
+
+[Service]
+ExecStart=/usr/bin/mutter_inject
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

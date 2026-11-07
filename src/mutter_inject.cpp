@@ -925,7 +925,7 @@ static void writeJmpViaRIP(uint8_t *code, uint64_t codeRip, uint64_t targetRip)
 	*(uint32_t *)&code[3] = (uint32_t)(targetRip - (codeRip + 7));
 }
 
-int main()
+static void injectOnce()
 {
 	auto pids = searchProcess();
 
@@ -1154,6 +1154,33 @@ int main()
 			}
 		}
 	}
+}
 
+static volatile sig_atomic_t sRunning = 1;
+
+static void handleSignal(int) {
+	sRunning = 0;
+}
+
+int main() {
+	signal(SIGTERM, handleSignal);
+	signal(SIGINT, handleSignal);
+
+	log("obs-gnome-capture-inject: starting injection daemon\n");
+
+	while (sRunning) {
+		injectOnce();
+
+		if (sRunning) {
+			sigset_t mask;
+			sigemptyset(&mask);
+			sigaddset(&mask, SIGTERM);
+			sigaddset(&mask, SIGINT);
+			sigprocmask(SIG_BLOCK, &mask, nullptr);
+			sigwait(&mask, nullptr);
+		}
+	}
+
+	log("obs-gnome-capture-inject: stopping\n");
 	return 0;
 }

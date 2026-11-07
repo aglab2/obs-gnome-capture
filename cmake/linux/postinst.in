@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+
+if systemctl --system is-active --quiet obs-gnome-capture-inject.service 2>/dev/null; then
+    systemctl --system restart obs-gnome-capture-inject.service
+else
+    systemctl --system enable --now obs-gnome-capture-inject.service 2>/dev/null || true
+fi
+
+exit 0

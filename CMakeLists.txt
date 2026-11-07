@@ -59,3 +59,13 @@ install(
 install(
   TARGETS mutter_list_windows
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+install(FILES data/obs-gnome-capture-inject.service
+        DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/systemd/system
+        RENAME obs-gnome-capture-inject.service)
+
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/linux/postinst.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/postinst"
+  @ONLY)
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${CMAKE_CURRENT_BINARY_DIR}/postinst")
