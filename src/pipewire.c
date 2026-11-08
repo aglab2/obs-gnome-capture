@@ -1128,8 +1128,7 @@ static const struct pw_core_events core_events = {
 
 /* obs_source_info methods */
 
-obs_pipewire *obs_pipewire_connect(const struct pw_registry_events *registry_events,
-				      void *user_data)
+obs_pipewire *obs_pipewire_connect(const struct pw_registry_events *registry_events, void *user_data)
 {
 	obs_pipewire *obs_pw;
 
@@ -1257,7 +1256,8 @@ obs_pipewire_stream *obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_sourc
 	}
 
 	pw_stream_connect(obs_pw_stream->stream, PW_DIRECTION_INPUT, pipewire_node,
-			  PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_DONT_RECONNECT, params, n_params);
+			  PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_DONT_RECONNECT,
+			  params, n_params);
 
 	blog(LOG_INFO, "[pipewire] Playing stream %p", obs_pw_stream->stream);
 

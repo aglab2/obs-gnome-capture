@@ -1158,11 +1158,13 @@ static void injectOnce()
 
 static volatile sig_atomic_t sRunning = 1;
 
-static void handleSignal(int) {
+static void handleSignal(int)
+{
 	sRunning = 0;
 }
 
-int main() {
+int main()
+{
 #if 0
 	signal(SIGTERM, handleSignal);
 	signal(SIGINT, handleSignal);
