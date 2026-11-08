@@ -29,10 +29,13 @@
 #include <gio/gio.h>
 #include <json-glib/json-glib.h>
 
+#include <atomic>
+#include <chrono>
 #include <variant>
 #include <vector>
-#include <string>
+#include <memory>
 #include <optional>
+#include <string>
 
 struct plug_t {
 	std::string connector;
@@ -60,7 +63,10 @@ struct mutter_capture {
 	obs_pipewire_stream *obs_pw_stream = nullptr;
 
 	std::vector<plug_t> plugs;
-	std::vector<window_t> windows;
+
+	std::chrono::steady_clock::time_point last_props_rescan = std::chrono::steady_clock::now();
+
+	GSource* rescan_sources = nullptr;
 };
 
 /* ------------------------------------------------- */
@@ -288,6 +294,7 @@ static void on_close_received_cb(GDBusConnection * /*connection*/, const gchar *
 	if (capture->session != ctx->session)
 		return;
 
+	blog(LOG_INFO, "[portals] Source closed");
 	g_clear_pointer(&capture->obs_pw_stream, obs_pipewire_stream_destroy);
 	g_clear_pointer(&capture->obs_pw, obs_pipewire_destroy);
 }
@@ -376,6 +383,7 @@ static struct mutter_capture *down_ctx_to_mutter_capture(struct async_context *c
 		return NULL;
 }
 
+static void defer_select_source(struct mutter_capture *capture);
 static void on_source_selected_cb(GObject *source, GAsyncResult *res, void *user_data)
 {
 	struct async_context *ctx = reinterpret_cast<struct async_context *>(user_data);
@@ -388,7 +396,9 @@ static void on_source_selected_cb(GObject *source, GAsyncResult *res, void *user
 	result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
 	if (error) {
 		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-			blog(LOG_ERROR, "[mutter] Error selecting screencast source: %s", error->message);
+		{
+			if (capture) defer_select_source(capture);
+		}
 
 		return;
 	}
@@ -422,7 +432,7 @@ static std::optional<uint64_t> find_window_id(const std::string &wm_class, uint6
 	return std::nullopt;
 }
 
-static void select_source(struct mutter_capture *capture)
+static bool try_select_source(struct mutter_capture *capture)
 {
 	auto decodedWnd = decode(capture->config);
 	if (auto plug = std::get_if<PlugDecode>(&decodedWnd)) {
@@ -439,7 +449,7 @@ static void select_source(struct mutter_capture *capture)
 	} else if (auto wnd = std::get_if<WindowDecode>(&decodedWnd)) {
 		std::optional<uint64_t> window_id = find_window_id(wnd->wm_class, wnd->id);
 		if (!window_id)
-			return;
+			return false;
 
 		struct async_context *ctx = new async_context;
 		ctx->capture = capture;
@@ -452,7 +462,37 @@ static void select_source(struct mutter_capture *capture)
 				       NULL, G_DBUS_CALL_FLAGS_NONE, -1, capture->cancellable, on_source_selected_cb,
 				       ctx);
 	} else {
-		return;
+		return false;
+	}
+
+	return true;
+}
+
+static gboolean select_source_rescan(gpointer data)
+{
+	struct mutter_capture* capture = reinterpret_cast<struct mutter_capture*>(data);
+	if (try_select_source(capture))
+	{
+		g_clear_pointer(&capture->rescan_sources, g_source_unref);
+		return G_SOURCE_REMOVE;
+	}
+	else
+	{
+		return G_SOURCE_CONTINUE;
+	}
+}
+
+static void defer_select_source(struct mutter_capture *capture)
+{
+	capture->rescan_sources = g_timeout_source_new_seconds(2);
+	g_source_set_callback(capture->rescan_sources, select_source_rescan, capture, NULL);
+}
+
+static void select_source(struct mutter_capture *capture)
+{
+	if (!try_select_source(capture))
+	{
+		defer_select_source(capture);
 	}
 }
 
@@ -499,6 +539,11 @@ static void create_session(struct mutter_capture *capture)
 
 static gboolean init_screencast_capture(struct mutter_capture *capture)
 {
+	if (capture->rescan_sources)
+	{
+		g_source_destroy(capture->rescan_sources);
+		g_clear_pointer(&capture->rescan_sources, g_source_unref);
+	}
 	capture->cancellable = g_cancellable_new();
 	if (!portal_get_dbus_connection())
 		return FALSE;
@@ -573,6 +618,13 @@ static void mutter_capture_destroy(void *data)
 	obs_pipewire_destroy(capture->obs_pw);
 	g_cancellable_cancel(capture->cancellable);
 	g_clear_object(&capture->cancellable);
+
+	if (capture->rescan_sources)
+	{
+		g_source_destroy(capture->rescan_sources);
+		g_clear_pointer(&capture->rescan_sources, g_source_unref);
+	}
+	
 	delete capture;
 }
 
@@ -581,6 +633,44 @@ static void mutter_capture_get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "source", "");
 	obs_data_set_default_bool(settings, "cursor", true);
 	// obs_data_set_default_bool(settings, "timestamps", false);
+}
+
+static void on_monitors_rescan_cb(GObject *source, GAsyncResult *res, void *user_data)
+{
+	struct mutter_capture *capture = reinterpret_cast<struct mutter_capture *>(user_data);
+
+	g_autoptr(GVariant) result = NULL;
+	g_autoptr(GError) error = NULL;
+
+	result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
+	if (error) {
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+			blog(LOG_ERROR, "[mutter] Error enumerating monitors: %s", error->message);
+		return;
+	}
+
+	GVariant *list;
+
+	g_variant_get(result, "(u@a((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})", NULL, &list, NULL,
+		      NULL);
+
+	GVariantIter iter;
+	g_variant_iter_init(&iter, list);
+
+	gchar *connector;
+	gchar *monitor;
+
+	capture->plugs.clear();
+	while (g_variant_iter_loop(&iter, "((ssss)a(siiddada{sv})a{sv})", &connector, NULL, &monitor, NULL, NULL,
+				   NULL)) {
+		plug_t plug;
+		plug.connector = connector;
+		plug.monitor = monitor;
+
+		capture->plugs.push_back(std::move(plug));
+	}
+
+	g_variant_unref(list);
 }
 
 static obs_properties_t *mutter_capture_get_properties(void *data)
@@ -597,13 +687,23 @@ static obs_properties_t *mutter_capture_get_properties(void *data)
 		obs_property_list_add_string(prop, plug.monitor.c_str(), encodePlug(plug).c_str());
 	}
 
-	const auto &windows = capture->windows;
+	auto windows = update_windows();
 	for (const auto &wnd : windows) {
 		obs_property_list_add_string(prop, wnd.title.c_str(), encodeWindow(wnd).c_str());
 	}
 
 	obs_properties_add_bool(props, "cursor", "Draw mouse cursor");
 	// obs_properties_add_bool(props, "timestamps", "Use running time as time stamps");
+
+	auto now = std::chrono::steady_clock::now();
+	if (now - capture->last_props_rescan > std::chrono::seconds(1))
+	{
+		capture->last_props_rescan = now;
+		g_dbus_connection_call(connection, "org.gnome.Mutter.DisplayConfig",
+						     "/org/gnome/Mutter/DisplayConfig",
+						     "org.gnome.Mutter.DisplayConfig", "GetCurrentState", NULL, NULL,
+						     G_DBUS_CALL_FLAGS_NONE, -1, capture->cancellable, on_monitors_rescan_cb, capture);
+	}
 
 	return props;
 }
