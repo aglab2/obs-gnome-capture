@@ -70,6 +70,46 @@ struct mutter_capture {
 };
 
 /* ------------------------------------------------- */
+/* Registry event handlers */
+
+static void on_registry_global_cb(void *user_data, uint32_t id, uint32_t permissions, const char *type,
+                                  uint32_t version, const struct spa_dict *props)
+{
+	UNUSED_PARAMETER(user_data);
+	UNUSED_PARAMETER(permissions);
+	UNUSED_PARAMETER(version);
+
+	if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
+		return;
+
+	std::string kv;
+
+	for (uint32_t i = 0; i < props->n_items; i++)
+	{
+		kv += props->items[i].key;
+		kv += "->";
+		kv += props->items[i].value;
+		kv += " ";
+	}
+
+	blog(LOG_INFO, "[pipewire] Registry global: id=%u type=%s %s", id, type ? type : "unknown", kv.c_str());
+
+}
+
+static void on_registry_global_remove_cb(void *user_data, uint32_t id)
+{
+	UNUSED_PARAMETER(user_data);
+
+	blog(LOG_INFO, "[pipewire] Registry global_remove: id=%u", id);
+}
+
+static const struct pw_registry_events registry_events = {
+	PW_VERSION_REGISTRY_EVENTS,
+	.global = on_registry_global_cb,
+	.global_remove = on_registry_global_remove_cb,
+};
+
+/* ------------------------------------------------- */
 
 struct Config {
 	std::string encoding;
@@ -265,7 +305,7 @@ static void on_start_response_received_cb(GDBusConnection * /*connection*/, cons
 
 	blog(LOG_INFO, "[mutter] source selected, setting up screencast");
 
-	capture->obs_pw = obs_pipewire_connect(NULL, NULL);
+	capture->obs_pw = obs_pipewire_connect(&registry_events, capture);
 
 	if (!capture->obs_pw)
 		return;
@@ -434,6 +474,8 @@ static std::optional<uint64_t> find_window_id(const std::string &wm_class, uint6
 
 static bool try_select_source(struct mutter_capture *capture)
 {
+	blog(LOG_INFO, "[mutter] Search: %s", capture->config.c_str());
+
 	auto decodedWnd = decode(capture->config);
 	if (auto plug = std::get_if<PlugDecode>(&decodedWnd)) {
 		struct async_context *ctx = new async_context;
