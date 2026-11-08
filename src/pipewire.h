@@ -31,9 +31,13 @@ extern "C" {
 typedef struct _obs_pipewire obs_pipewire;
 typedef struct _obs_pipewire_stream obs_pipewire_stream;
 
+typedef void (*obs_pipewire_stream_dropped)(void *user_data);
+
 struct obs_pipewire_connect_stream_info {
 	const char *stream_name;
 	struct pw_properties *stream_properties;
+	obs_pipewire_stream_dropped stream_dropped;
+	void *stream_dropped_user_data;
 	struct {
 		bool cursor_visible;
 	} screencast;

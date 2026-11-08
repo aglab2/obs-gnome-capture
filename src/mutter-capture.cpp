@@ -66,47 +66,7 @@ struct mutter_capture {
 
 	std::chrono::steady_clock::time_point last_props_rescan = std::chrono::steady_clock::now();
 
-	GSource* rescan_sources = nullptr;
-};
-
-/* ------------------------------------------------- */
-/* Registry event handlers */
-
-static void on_registry_global_cb(void *user_data, uint32_t id, uint32_t permissions, const char *type,
-                                  uint32_t version, const struct spa_dict *props)
-{
-	UNUSED_PARAMETER(user_data);
-	UNUSED_PARAMETER(permissions);
-	UNUSED_PARAMETER(version);
-
-	if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
-		return;
-
-	std::string kv;
-
-	for (uint32_t i = 0; i < props->n_items; i++)
-	{
-		kv += props->items[i].key;
-		kv += "->";
-		kv += props->items[i].value;
-		kv += " ";
-	}
-
-	blog(LOG_INFO, "[pipewire] Registry global: id=%u type=%s %s", id, type ? type : "unknown", kv.c_str());
-
-}
-
-static void on_registry_global_remove_cb(void *user_data, uint32_t id)
-{
-	UNUSED_PARAMETER(user_data);
-
-	blog(LOG_INFO, "[pipewire] Registry global_remove: id=%u", id);
-}
-
-static const struct pw_registry_events registry_events = {
-	PW_VERSION_REGISTRY_EVENTS,
-	.global = on_registry_global_cb,
-	.global_remove = on_registry_global_remove_cb,
+	GSource *rescan_sources = nullptr;
 };
 
 /* ------------------------------------------------- */
@@ -287,6 +247,13 @@ static void delete_signal_context(struct signal_context *ctx)
 	delete ctx;
 }
 
+static bool reload_session(struct mutter_capture *capture);
+static void on_pw_stream_dropped(void *user_data)
+{
+	struct mutter_capture *capture = reinterpret_cast<struct mutter_capture *>(user_data);
+	reload_session(capture);
+}
+
 static void on_start_response_received_cb(GDBusConnection * /*connection*/, const gchar * /*sender_name*/,
 					  const gchar * /*object_path*/, const gchar * /*interface_name*/,
 					  const gchar * /*signal_name*/, GVariant *parameters, gpointer user_data)
@@ -305,7 +272,7 @@ static void on_start_response_received_cb(GDBusConnection * /*connection*/, cons
 
 	blog(LOG_INFO, "[mutter] source selected, setting up screencast");
 
-	capture->obs_pw = obs_pipewire_connect(&registry_events, capture);
+	capture->obs_pw = obs_pipewire_connect(NULL, NULL);
 
 	if (!capture->obs_pw)
 		return;
@@ -314,6 +281,8 @@ static void on_start_response_received_cb(GDBusConnection * /*connection*/, cons
 		.stream_name = "OBS Studio",
 		.stream_properties = pw_properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture",
 						       PW_KEY_MEDIA_ROLE, "Screen", NULL),
+		.stream_dropped = on_pw_stream_dropped,
+		.stream_dropped_user_data = capture,
 		.screencast =
 			{
 				.cursor_visible = capture->cursor_visible,
@@ -437,9 +406,9 @@ static void on_source_selected_cb(GObject *source, GAsyncResult *res, void *user
 
 	result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
 	if (error) {
-		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-		{
-			if (capture) defer_select_source(capture);
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+			if (capture)
+				defer_select_source(capture);
 		}
 
 		return;
@@ -451,8 +420,12 @@ static void on_source_selected_cb(GObject *source, GAsyncResult *res, void *user
 	gchar *stream_path = NULL;
 	g_variant_get(result, "(o)", &stream_path, NULL);
 
-	if (!stream_path)
+	if (!stream_path) {
+		if (capture)
+			defer_select_source(capture);
+
 		return;
+	}
 
 	start(capture, stream_path);
 }
@@ -476,8 +449,6 @@ static std::optional<uint64_t> find_window_id(const std::string &wm_class, uint6
 
 static bool try_select_source(struct mutter_capture *capture)
 {
-	blog(LOG_INFO, "[mutter] Search: %s", capture->config.c_str());
-
 	auto decodedWnd = decode(capture->config);
 	if (auto plug = std::get_if<PlugDecode>(&decodedWnd)) {
 		struct async_context *ctx = new async_context;
@@ -514,14 +485,11 @@ static bool try_select_source(struct mutter_capture *capture)
 
 static gboolean select_source_rescan(gpointer data)
 {
-	struct mutter_capture* capture = reinterpret_cast<struct mutter_capture*>(data);
-	if (try_select_source(capture))
-	{
+	struct mutter_capture *capture = reinterpret_cast<struct mutter_capture *>(data);
+	if (try_select_source(capture)) {
 		g_clear_pointer(&capture->rescan_sources, g_source_unref);
 		return G_SOURCE_REMOVE;
-	}
-	else
-	{
+	} else {
 		return G_SOURCE_CONTINUE;
 	}
 }
@@ -530,12 +498,13 @@ static void defer_select_source(struct mutter_capture *capture)
 {
 	capture->rescan_sources = g_timeout_source_new_seconds(2);
 	g_source_set_callback(capture->rescan_sources, select_source_rescan, capture, NULL);
+	g_source_attach(capture->rescan_sources, NULL);
 }
 
 static void select_source(struct mutter_capture *capture)
 {
-	if (!try_select_source(capture))
-	{
+	if (!try_select_source(capture)) {
+		blog(LOG_INFO, "[mutter] deferring for next rescan");
 		defer_select_source(capture);
 	}
 }
@@ -583,8 +552,7 @@ static void create_session(struct mutter_capture *capture)
 
 static gboolean init_screencast_capture(struct mutter_capture *capture)
 {
-	if (capture->rescan_sources)
-	{
+	if (capture->rescan_sources) {
 		g_source_destroy(capture->rescan_sources);
 		g_clear_pointer(&capture->rescan_sources, g_source_unref);
 	}
@@ -663,12 +631,11 @@ static void mutter_capture_destroy(void *data)
 	g_cancellable_cancel(capture->cancellable);
 	g_clear_object(&capture->cancellable);
 
-	if (capture->rescan_sources)
-	{
+	if (capture->rescan_sources) {
 		g_source_destroy(capture->rescan_sources);
 		g_clear_pointer(&capture->rescan_sources, g_source_unref);
 	}
-	
+
 	delete capture;
 }
 
@@ -695,8 +662,7 @@ static void on_monitors_rescan_cb(GObject *source, GAsyncResult *res, void *user
 
 	GVariant *list;
 
-	g_variant_get(result, "(u@a((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})", NULL, &list, NULL,
-		      NULL);
+	g_variant_get(result, "(u@a((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})", NULL, &list, NULL, NULL);
 
 	GVariantIter iter;
 	g_variant_iter_init(&iter, list);
@@ -740,13 +706,12 @@ static obs_properties_t *mutter_capture_get_properties(void *data)
 	// obs_properties_add_bool(props, "timestamps", "Use running time as time stamps");
 
 	auto now = std::chrono::steady_clock::now();
-	if (now - capture->last_props_rescan > std::chrono::seconds(1))
-	{
+	if (now - capture->last_props_rescan > std::chrono::seconds(1)) {
 		capture->last_props_rescan = now;
-		g_dbus_connection_call(connection, "org.gnome.Mutter.DisplayConfig",
-						     "/org/gnome/Mutter/DisplayConfig",
-						     "org.gnome.Mutter.DisplayConfig", "GetCurrentState", NULL, NULL,
-						     G_DBUS_CALL_FLAGS_NONE, -1, capture->cancellable, on_monitors_rescan_cb, capture);
+		g_dbus_connection_call(connection, "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+				       "org.gnome.Mutter.DisplayConfig", "GetCurrentState", NULL, NULL,
+				       G_DBUS_CALL_FLAGS_NONE, -1, capture->cancellable, on_monitors_rescan_cb,
+				       capture);
 	}
 
 	return props;

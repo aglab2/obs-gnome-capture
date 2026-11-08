@@ -97,6 +97,9 @@ struct _obs_pipewire_stream {
 	obs_pipewire *obs_pw;
 	obs_source_t *source;
 
+	obs_pipewire_stream_dropped stream_dropped_cb;
+	void *stream_dropped_user_data;
+
 	gs_texture_t *texture;
 
 	struct pw_stream *stream;
@@ -1061,6 +1064,14 @@ static void on_param_changed_cb(void *user_data, uint32_t id, const struct spa_p
 	obs_pw_stream->negotiated = true;
 }
 
+static gboolean stream_state_idle_cb(gpointer data)
+{
+	obs_pipewire_stream *obs_pw_stream = (obs_pipewire_stream *)data;
+	obs_pw_stream->stream_dropped_cb(obs_pw_stream->stream_dropped_user_data);
+
+	return G_SOURCE_REMOVE;
+}
+
 static void on_state_changed_cb(void *user_data, enum pw_stream_state old, enum pw_stream_state state,
 				const char *error)
 {
@@ -1070,6 +1081,11 @@ static void on_state_changed_cb(void *user_data, enum pw_stream_state old, enum 
 
 	blog(LOG_INFO, "[pipewire] Stream %p state: \"%s\" (error: %s)", obs_pw_stream->stream,
 	     pw_stream_state_as_string(state), error ? error : "none");
+
+	if (obs_pw_stream->stream_dropped_cb && state == PW_STREAM_STATE_UNCONNECTED) {
+		blog(LOG_WARNING, "[pipewire] Stream %p is now unconnected", obs_pw_stream->stream);
+		g_main_context_invoke(NULL, stream_state_idle_cb, obs_pw_stream);
+	}
 }
 
 static const struct pw_stream_events stream_events = {
@@ -1201,6 +1217,8 @@ obs_pipewire_stream *obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_sourc
 	obs_pw_stream = bzalloc(sizeof(obs_pipewire_stream));
 	obs_pw_stream->obs_pw = obs_pw;
 	obs_pw_stream->source = source;
+	obs_pw_stream->stream_dropped_cb = connect_info->stream_dropped;
+	obs_pw_stream->stream_dropped_user_data = connect_info->stream_dropped_user_data;
 	obs_pw_stream->cursor.visible = connect_info->screencast.cursor_visible;
 	obs_pw_stream->framerate.set = connect_info->video.framerate != NULL;
 	obs_pw_stream->resolution.set = connect_info->video.resolution != NULL;
@@ -1239,7 +1257,7 @@ obs_pipewire_stream *obs_pipewire_connect_stream(obs_pipewire *obs_pw, obs_sourc
 	}
 
 	pw_stream_connect(obs_pw_stream->stream, PW_DIRECTION_INPUT, pipewire_node,
-			  PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, n_params);
+			  PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_DONT_RECONNECT, params, n_params);
 
 	blog(LOG_INFO, "[pipewire] Playing stream %p", obs_pw_stream->stream);
 
@@ -1402,6 +1420,7 @@ void obs_pipewire_stream_destroy(obs_pipewire_stream *obs_pw_stream)
 	if (!obs_pw_stream)
 		return;
 
+	obs_pw_stream->stream_dropped_cb = NULL;
 	output_flags = obs_source_get_output_flags(obs_pw_stream->source);
 	if (output_flags & OBS_SOURCE_ASYNC_VIDEO)
 		obs_source_output_video(obs_pw_stream->source, NULL);
