@@ -344,11 +344,12 @@ static void on_cancelled_cb(GCancellable *cancellable, void *user_data)
 	UNUSED_PARAMETER(cancellable);
 
 	struct signal_context *ctx = reinterpret_cast<struct signal_context *>(user_data);
+	std::string session = std::move(ctx->session);
 	delete_signal_context(ctx);
 
 	blog(LOG_INFO, "[portals] Request cancelled");
 
-	g_dbus_connection_call(connection, "org.gnome.Mutter.ScreenCast", ctx->session.c_str(),
+	g_dbus_connection_call(connection, "org.gnome.Mutter.ScreenCast", session.c_str(),
 			       "org.gnome.Mutter.ScreenCast.Session", "Stop", NULL, NULL, G_DBUS_CALL_FLAGS_NONE, -1,
 			       NULL, NULL, NULL);
 }
@@ -383,6 +384,7 @@ static void start(struct mutter_capture *capture, const char *stream_path)
 							   (GDBusSignalFlags)G_DBUS_CALL_FLAGS_NONE,
 							   on_start_response_received_cb, ctx, NULL);
 
+	ctx->cancellable = g_object_ref(capture->cancellable);
 	ctx->cancel_id = g_signal_connect(ctx->cancellable, "cancelled", G_CALLBACK(on_cancelled_cb), ctx);
 
 	g_dbus_connection_call(connection, "org.gnome.Mutter.ScreenCast", capture->session.c_str(),
