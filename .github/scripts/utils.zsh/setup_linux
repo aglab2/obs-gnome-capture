@@ -65,7 +65,7 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
   sudo apt-get remove libunwind-\*
 
   sudo apt-get install ${apt_args} \
-    libpipewire-0.3-dev${suffix}
+    libpipewire-0.3-dev${suffix} \
     libjson-glib-dev${suffix}
 
   log_group
