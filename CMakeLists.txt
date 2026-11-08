@@ -8,7 +8,7 @@ option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
 option(ENABLE_QT "Use Qt functionality" OFF)
 
 find_package(Gio 2.72.4 REQUIRED)
-find_package(GStreamer REQUIRED COMPONENTS video)
+find_package(PipeWire 0.3.33 REQUIRED)
 find_package(JsonGlib REQUIRED)
 
 include(compilerconfig)
@@ -18,7 +18,7 @@ include(helpers)
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
 find_package(libobs REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs gio::gio ${GSTREAMER_LIBRARIES} ${GSTREAMER_BASE_LIBRARIES} ${GSTREAMER_VIDEO_LIBRARIES} ${GSTREAMER_APP_LIBRARIES} ${JSON_GLIB_LIBRARIES})
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs gio::gio PipeWire::PipeWire ${JSON_GLIB_LIBRARIES})
 
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
@@ -38,8 +38,8 @@ if(ENABLE_QT)
                AUTORCC ON)
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/gnome-capture.cpp)
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${GSTREAMER_INCLUDE_DIRS} ${JSON_GLIB_INCLUDE_DIRS})
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/mutter-capture.cpp src/pipewire.c src/formats.c)
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${JSON_GLIB_INCLUDE_DIRS})
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 

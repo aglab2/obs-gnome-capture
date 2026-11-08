@@ -1163,6 +1163,7 @@ static void handleSignal(int) {
 }
 
 int main() {
+#if 0
 	signal(SIGTERM, handleSignal);
 	signal(SIGINT, handleSignal);
 
@@ -1182,5 +1183,8 @@ int main() {
 	}
 
 	log("obs-gnome-capture-inject: stopping\n");
+#else
+	injectOnce();
+#endif
 	return 0;
 }
