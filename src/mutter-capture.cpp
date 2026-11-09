@@ -30,7 +30,6 @@
 #include <json-glib/json-glib.h>
 
 #include <atomic>
-#include <chrono>
 #include <variant>
 #include <vector>
 #include <memory>
@@ -62,11 +61,9 @@ struct mutter_capture {
 	obs_pipewire *obs_pw = nullptr;
 	obs_pipewire_stream *obs_pw_stream = nullptr;
 
-	std::vector<plug_t> plugs;
-
-	std::chrono::steady_clock::time_point last_props_rescan = std::chrono::steady_clock::now();
-
 	GSource *rescan_sources = nullptr;
+
+	std::string props_window_str;
 };
 
 /* ------------------------------------------------- */
@@ -188,6 +185,26 @@ static std::vector<window_t> update_windows()
 	g_object_unref(parser);
 
 	return windows;
+}
+
+static std::string get_windows_string()
+{
+	std::vector<window_t> windows;
+
+	char path[128];
+	snprintf(path, sizeof(path), "/run/user/%d/obs_windows.json", getuid());
+
+	GError *err = NULL;
+	gchar *contents = NULL;
+	if (!g_file_get_contents(path, &contents, NULL, &err)) {
+		g_error_free(err);
+		return {};
+	}
+
+	std::string res = contents;
+	g_free(contents);
+
+	return res;
 }
 
 /* ------------------------------------------------- */
@@ -646,18 +663,18 @@ static void mutter_capture_get_defaults(obs_data_t *settings)
 	// obs_data_set_default_bool(settings, "timestamps", false);
 }
 
-static void on_monitors_rescan_cb(GObject *source, GAsyncResult *res, void *user_data)
+static std::vector<plug_t> update_plugs(void)
 {
-	struct mutter_capture *capture = reinterpret_cast<struct mutter_capture *>(user_data);
-
-	g_autoptr(GVariant) result = NULL;
 	g_autoptr(GError) error = NULL;
+	g_autoptr(GVariant) result = g_dbus_connection_call_sync(connection, "org.gnome.Mutter.DisplayConfig",
+								 "/org/gnome/Mutter/DisplayConfig",
+								 "org.gnome.Mutter.DisplayConfig", "GetCurrentState",
+								 NULL, NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
 
-	result = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &error);
 	if (error) {
 		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
 			blog(LOG_ERROR, "[mutter] Error enumerating monitors: %s", error->message);
-		return;
+		return {};
 	}
 
 	GVariant *list;
@@ -670,28 +687,27 @@ static void on_monitors_rescan_cb(GObject *source, GAsyncResult *res, void *user
 	gchar *connector;
 	gchar *monitor;
 
-	capture->plugs.clear();
+	std::vector<plug_t> plugs;
 	while (g_variant_iter_loop(&iter, "((ssss)a(siiddada{sv})a{sv})", &connector, NULL, &monitor, NULL, NULL,
 				   NULL)) {
 		plug_t plug;
 		plug.connector = connector;
 		plug.monitor = monitor;
 
-		capture->plugs.push_back(std::move(plug));
+		plugs.push_back(std::move(plug));
 	}
 
 	g_variant_unref(list);
+
+	return plugs;
 }
 
-static obs_properties_t *mutter_capture_get_properties(void *data)
+static bool refresh_list(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
 {
-	struct mutter_capture *capture = reinterpret_cast<struct mutter_capture *>(data);
+	(void) props; (void) settings;
+	obs_property_list_clear(prop);
 
-	obs_properties_t *props = obs_properties_create();
-	obs_property_t *prop =
-		obs_properties_add_list(props, "source", "Source", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-
-	const auto &plugs = capture->plugs;
+	auto plugs = update_plugs();
 	obs_property_list_add_string(prop, "", "");
 	for (const auto &plug : plugs) {
 		obs_property_list_add_string(prop, plug.monitor.c_str(), encodePlug(plug).c_str());
@@ -702,17 +718,22 @@ static obs_properties_t *mutter_capture_get_properties(void *data)
 		obs_property_list_add_string(prop, wnd.title.c_str(), encodeWindow(wnd).c_str());
 	}
 
+	return true;
+}
+
+static obs_properties_t *mutter_capture_get_properties(void *data)
+{
+	(void) data;
+	obs_properties_t *props = obs_properties_create();
+	obs_property_t *prop =
+		obs_properties_add_list(props, "source", "Source", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+
+	obs_property_list_add_string(prop, "", "");
+
+	obs_property_set_modified_callback(prop, refresh_list);
+
 	obs_properties_add_bool(props, "cursor", "Draw mouse cursor");
 	// obs_properties_add_bool(props, "timestamps", "Use running time as time stamps");
-
-	auto now = std::chrono::steady_clock::now();
-	if (now - capture->last_props_rescan > std::chrono::seconds(1)) {
-		capture->last_props_rescan = now;
-		g_dbus_connection_call(connection, "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
-				       "org.gnome.Mutter.DisplayConfig", "GetCurrentState", NULL, NULL,
-				       G_DBUS_CALL_FLAGS_NONE, -1, capture->cancellable, on_monitors_rescan_cb,
-				       capture);
-	}
 
 	return props;
 }
