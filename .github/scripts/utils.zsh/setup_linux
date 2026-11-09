@@ -66,6 +66,7 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
 
   sudo apt-get install ${apt_args} \
     libpipewire-0.3-dev${suffix} \
+    libdrm-dev${suffix} \
     libjson-glib-dev${suffix}
 
   log_group
