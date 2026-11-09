@@ -29,22 +29,41 @@
 #include <gio/gio.h>
 #include <json-glib/json-glib.h>
 
-#include <atomic>
+#include <algorithm>
 #include <variant>
 #include <vector>
-#include <memory>
 #include <optional>
 #include <string>
 
 struct plug_t {
 	std::string connector;
 	std::string monitor;
+
+	bool operator<(const plug_t& other) const
+	{
+		if (connector < other.connector)
+			return true;
+		if (connector > other.connector)
+			return false;
+		
+		return monitor < other.monitor;
+	}
 };
 
 struct window_t {
 	guint64 id;
 	std::string title;
 	std::string wm_class;
+
+	bool operator<(const window_t& other) const
+	{
+		if (title < other.title)
+			return true;
+		if (title > other.title)
+			return false;
+		
+		return wm_class < other.wm_class;
+	}
 };
 
 struct mutter_capture {
@@ -702,22 +721,73 @@ static std::vector<plug_t> update_plugs(void)
 	return plugs;
 }
 
+static void insert_preserved_val(obs_property_t *p, const char *val, size_t idx)
+{
+	auto res = decode(val);
+
+	if (auto plug = std::get_if<PlugDecode>(&res))
+	{
+		obs_property_list_insert_string(p, idx, plug->connector.c_str(), val);
+	}
+
+	if (auto wnd = std::get_if<WindowDecode>(&res))
+	{
+		obs_property_list_insert_string(p, idx, wnd->title.c_str(), val);
+	}
+
+	obs_property_list_item_disable(p, idx, true);
+}
+
+static bool ms_check_window_property_setting(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings, const char *val, size_t idx)
+{
+	const char *cur_val;
+	bool match = false;
+	size_t i = 0;
+
+	cur_val = obs_data_get_string(settings, val);
+	if (!cur_val) {
+		return false;
+	}
+
+	for (;;) {
+		const char *xval = obs_property_list_item_string(p, i++);
+		if (!xval)
+			break;
+
+		if (strcmp(xval, cur_val) == 0) {
+			match = true;
+			break;
+		}
+	}
+
+	if (cur_val && *cur_val && !match) {
+		insert_preserved_val(p, cur_val, idx);
+		return true;
+	}
+
+	UNUSED_PARAMETER(ppts);
+	return false;
+}
+
 static bool refresh_list(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
 {
 	(void) props; (void) settings;
 	obs_property_list_clear(prop);
 
 	auto plugs = update_plugs();
+	std::sort(plugs.begin(), plugs.end());
 	obs_property_list_add_string(prop, "", "");
 	for (const auto &plug : plugs) {
 		obs_property_list_add_string(prop, plug.monitor.c_str(), encodePlug(plug).c_str());
 	}
 
 	auto windows = update_windows();
+	std::sort(windows.begin(), windows.end());
 	for (const auto &wnd : windows) {
 		obs_property_list_add_string(prop, wnd.title.c_str(), encodeWindow(wnd).c_str());
 	}
 
+	ms_check_window_property_setting(props, prop, settings, "source", 0);
 	return true;
 }
 
