@@ -39,13 +39,13 @@ struct plug_t {
 	std::string connector;
 	std::string monitor;
 
-	bool operator<(const plug_t& other) const
+	bool operator<(const plug_t &other) const
 	{
 		if (connector < other.connector)
 			return true;
 		if (connector > other.connector)
 			return false;
-		
+
 		return monitor < other.monitor;
 	}
 };
@@ -55,13 +55,13 @@ struct window_t {
 	std::string title;
 	std::string wm_class;
 
-	bool operator<(const window_t& other) const
+	bool operator<(const window_t &other) const
 	{
 		if (title < other.title)
 			return true;
 		if (title > other.title)
 			return false;
-		
+
 		return wm_class < other.wm_class;
 	}
 };
@@ -725,20 +725,19 @@ static void insert_preserved_val(obs_property_t *p, const char *val, size_t idx)
 {
 	auto res = decode(val);
 
-	if (auto plug = std::get_if<PlugDecode>(&res))
-	{
+	if (auto plug = std::get_if<PlugDecode>(&res)) {
 		obs_property_list_insert_string(p, idx, plug->connector.c_str(), val);
 	}
 
-	if (auto wnd = std::get_if<WindowDecode>(&res))
-	{
+	if (auto wnd = std::get_if<WindowDecode>(&res)) {
 		obs_property_list_insert_string(p, idx, wnd->title.c_str(), val);
 	}
 
 	obs_property_list_item_disable(p, idx, true);
 }
 
-static bool ms_check_window_property_setting(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings, const char *val, size_t idx)
+static bool ms_check_window_property_setting(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings,
+					     const char *val, size_t idx)
 {
 	const char *cur_val;
 	bool match = false;
@@ -771,7 +770,8 @@ static bool ms_check_window_property_setting(obs_properties_t *ppts, obs_propert
 
 static bool refresh_list(obs_properties_t *props, obs_property_t *prop, obs_data_t *settings)
 {
-	(void) props; (void) settings;
+	(void)props;
+	(void)settings;
 	obs_property_list_clear(prop);
 
 	auto plugs = update_plugs();
@@ -793,7 +793,7 @@ static bool refresh_list(obs_properties_t *props, obs_property_t *prop, obs_data
 
 static obs_properties_t *mutter_capture_get_properties(void *data)
 {
-	(void) data;
+	(void)data;
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *prop =
 		obs_properties_add_list(props, "source", "Source", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
